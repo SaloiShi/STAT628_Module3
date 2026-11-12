@@ -1,0 +1,20 @@
+---
+title: "Technical Report"
+subtitle: "Fall 2026"
+author: "Yu Lu, Liya Shi, Wanyun Si"
+date: last-modified
+geometry:
+  - margin=1in
+format:
+  pdf:
+    documentclass: article
+    pdf-engine: xelatex
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+execute:
+  warning: false
+  message: false
+  echo: false
+---
