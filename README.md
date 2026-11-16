@@ -1,19 +1,20 @@
 # STAT628_Module3
 
 ## Assignments：
-1 Flight cancellation: Binary classification; output the probability of cancellation.
-2 Departure delay: Predict the delay in minutes, allowing negative values to indicate an early departure.
-3 Arrival delay: Predict the delay in minutes, allowing negative values to indicate an early arrival.
-4 Excessive taxi time: Binary classification based on a predefined threshold for “excessively long” taxi time; this reflects taxi-related risk.
+- Flight cancellation: Binary classification; output the probability of cancellation.
+- Departure delay: Predict the delay in minutes, allowing negative values to indicate an early departure.
+- Arrival delay: Predict the delay in minutes, allowing negative values to indicate an early arrival.
+- Excessive taxi time: Binary classification based on a predefined threshold for “excessively long” taxi time; this reflects taxi-related risk.
 
 ## Plan for scoping the data：
-September–December 2023;
-September–December 2024;
-September–November 2025.
+### Date Range
+- September–December 2023;
+- September–December 2024;
+- September–November 2025.
+### Flight Corp Range
+We selected four airlines—**WN, AA, DL, and UA**—and combined their data across all three years. We excluded rows where Diverted = 1, then selected the top 10 origin cities with the highest record counts in the remaining data for these four airlines.
 
-We selected four airlines—WN, AA, DL, and UA—and combined their data across all three years. We excluded rows where Diverted = 1, then selected the top 10 origin cities with the highest record counts in the remaining data for these four airlines.
-
-Our data plan is as follows:
+## Our data plan is as follows:
 - Training set: Combine September–November data from 2023 and 2024 to train the baseline model.
 - Validation set: Use December data from 2023 and 2024 for model tuning and validation.
 - Test set: Use September–November 2025 data to evaluate model performance on unseen data.
@@ -34,6 +35,7 @@ Check for duplicate records and validate airport codes, airline codes, and sched
 - How does operational efficiency vary across airlines, and what factors contribute to these differences, particularly at airports in their headquarters cities?
 - What patterns do departure and arrival delays exhibit across years, seasons, and weekdays versus weekends?
 
+## Mainly Used Valuables (so far, may change in the future)
 - day of week
 - flight date
 - reporting airline
