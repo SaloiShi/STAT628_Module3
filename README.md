@@ -6,7 +6,7 @@
 3 Arrival delay: Predict the delay in minutes, allowing negative values to indicate an early arrival.
 4 Excessive taxi time: Binary classification based on a predefined threshold for “excessively long” taxi time; this reflects taxi-related risk.
 
-## plan for scoping the data：
+## Plan for scoping the data：
 September–December 2023;
 September–December 2024;
 September–November 2025.
