@@ -1,24 +1,26 @@
 # STAT628_Module3
 
-## 四个任务：
-1 是否取消：二分类，输出取消概率。
-2 出发延误时长：预测分钟数，允许负值表示提前。
-3 到达延误时长：预测分钟数，允许负值表示提前。
-4 滑行是否异常长：可以做二分类，先定义“异常长”的标准；反映滑行风险。
+## Assignments：
+1 Flight cancellation: Binary classification; output the probability of cancellation.
+2 Departure delay: Predict the delay in minutes, allowing negative values to indicate an early departure.
+3 Arrival delay: Predict the delay in minutes, allowing negative values to indicate an early arrival.
+4 Excessive taxi time: Binary classification based on a predefined threshold for “excessively long” taxi time; this reflects taxi-related risk.
 
-## 选取数据：
-2023 年 9–12 月；
-2024 年 9–12 月；
-2025 年 9–11 月。
-至少使用两个年份，必须包括 2025 年。条件允许，可以保留全部指定月份。
-选至少 10 个不同城市，至少两家公司，优先选择在所选机场之间都有较多航班、且部分航线重叠的公司。
-【WN AA DL UA 始发city前十 三年所有数据,去除diverted为1的数据】
-23-24同月份合并
-9-11baseline
-23 24的12作为模型调整验证
+## plan for scoping the data：
+September–December 2023;
+September–December 2024;
+September–November 2025.
 
-## 数据清洗：
-检查重复记录、机场和航空公司代码、计划日期时间等；加入机场时区和海拔，并标准化时间（处理 UTC、跨日及夏令时）。
+We selected four airlines—WN, AA, DL, and UA—and combined their data across all three years. We excluded rows where Diverted = 1, then selected the top 10 origin cities with the highest record counts in the remaining data for these four airlines.
+
+Our data plan is as follows:
+- Training set: Combine September–November data from 2023 and 2024 to train the baseline model.
+- Validation set: Use December data from 2023 and 2024 for model tuning and validation.
+- Test set: Use September–November 2025 data to evaluate model performance on unseen data.
+The final goal is to predict flight outcomes for December 2025.
+
+## Data cleaning：
+Check for duplicate records and validate airport codes, airline codes, and scheduled dates and times. Add airport time zones and elevations, and standardize timestamps to account for UTC conversion, date rollovers, and daylight saving time.
 
 ## Main Purpose
 - whether their flight will be canceled
@@ -28,9 +30,9 @@
 - the associated uncertainty for each prediction.
 
 ## Focus on...
-- If the center (airport) of the airline affect the delay time?（影响delay time的因素）
-- 不同航司之间航班执行效率差异，影响因素（重点关注航司总部城市的机场）
-- 出发和到达延误呈现怎样的规律（年份、季节、工作日与休息日因素）？
+- Factors Affecting Flight Delays：Does an airport’s location in an airline’s headquarters city affect flight delays?
+- How does operational efficiency vary across airlines, and what factors contribute to these differences, particularly at airports in their headquarters cities?
+- What patterns do departure and arrival delays exhibit across years, seasons, and weekdays versus weekends?
 
 - day of week
 - flight date
