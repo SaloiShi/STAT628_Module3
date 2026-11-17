@@ -19,8 +19,19 @@ served by flights departing from the ten highest-ranked cities. The filtered
 records and all original fields are saved in `flights_scoped.csv`.
 
 ```{r scoping, echo=FALSE, message=FALSE}
-months <- c(paste0("2023_", 9:12), paste0("2024_", 9:12), paste0("2025_", 9:11))
-files <- file.path("airplanes_data", paste0("airlines_", months, ".csv"))
+files <- c(
+  "airlines_2023_9.csv",  "airlines_2023_10.csv",
+  "airlines_2023_11.csv", "airlines_2023_12.csv",
+  "airlines_2024_9.csv",  "airlines_2024_10.csv",
+  "airlines_2024_11.csv", "airlines_2024_12.csv",
+  "airlines_2025_9.csv",  "airlines_2025_10.csv",
+  "airlines_2025_11.csv"
+)
+
+months <- sub("^airlines_(.*)\\.csv$", "\\1", files)
+
+files <- file.path("stat628_airplanes", files)
+
 missing_files <- files[!file.exists(files)]
 if (length(missing_files)) {
   stop("Missing files: ", paste(missing_files, collapse = ", "))
