@@ -37,7 +37,7 @@ Check for duplicate records and validate airport codes, airline codes, and sched
 - How does operational efficiency vary across airlines, and what factors contribute to these differences, particularly at airports in their headquarters cities?
 - What patterns do departure and arrival delays exhibit across years, seasons, and weekdays versus weekends?
 
-## Mainly Used Valuables (so far, may change in the future)
+## Mainly Used Variables (so far, may change in the future)
 - day of week
 - flight date
 - reporting airline
