@@ -27,6 +27,8 @@ The final goal is to predict flight outcomes for December 2025.
 Check for duplicate records and validate airport codes, airline codes, and scheduled dates and times. Add airport time zones and elevations, and standardize timestamps to account for UTC conversion, date rollovers, and daylight saving time.
 
 ## Main Purpose
+(Do some data exploration first)
+
 - whether their flight will be canceled
 - whether their flight will depart on-time and, if not, the length of the departure delay (which may be negative for early departure)
 - whether their flight will arrive on-time and, if not, the length of the arrival delay (which may be negative for early arrival)
