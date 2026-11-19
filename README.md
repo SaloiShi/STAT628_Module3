@@ -30,12 +30,12 @@ Check for duplicate records and validate airport codes, airline codes, and sched
 - whether their flight will depart on-time and, if not, the length of the departure delay (which may be negative for early departure)
 - whether their flight will arrive on-time and, if not, the length of the arrival delay (which may be negative for early arrival)
 - whether taxi-out or taxi-in is a big factor in departure or arrival delay
-- the associated uncertainty for each prediction.
 
 ## Focus on...
 - Factors Affecting Flight Delays：Does an airport’s location in an airline’s headquarters city affect flight delays?
 - How does operational efficiency vary across airlines, and what factors contribute to these differences, particularly at airports in their headquarters cities?
 - What patterns do departure and arrival delays exhibit across years, seasons, and weekdays versus weekends?
+- the associated uncertainty for each prediction.
 
 ## Mainly Used Variables (so far, may change in the future)
 - day of week
