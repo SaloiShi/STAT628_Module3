@@ -58,12 +58,23 @@ top_cities <- head(city_counts, 10)
 # Process one month at a time so only one full input file is held in memory.
 local_time_cols <- c("FlightDate", "CRSDepTime", "CRSArrTime",
                      "DepTime", "ArrTime", "WheelsOff", "WheelsOn")
+char_cols <- c(local_time_cols, "CancellationCode")
+
+reference_header <- names(fread(files[1L], nrows = 0L))
+same_header <- vapply(files, function(path) {
+  identical(names(fread(path, nrows = 0L)), reference_header)
+}, logical(1))
+
+if (!all(same_header)) {
+  stop("Different column names or order: ",
+       paste(basename(files[!same_header]), collapse = ", "))
+}
 scoped_file <- "flights_scoped.csv"
 temp_file <- tempfile(pattern = "flights_scoped_", tmpdir = dirname(scoped_file))
 rows_written <- 0L
 
 for (i in seq_along(files)) {
-  x <- fread(files[i], colClasses = list(character = local_time_cols))
+    x <- fread(files[i], colClasses = list(character = char_cols))
   selected <- x[in_scope(x) & OriginCityName %chin% top_cities$OriginCityName]
   rows_written <- rows_written + nrow(selected)
   fwrite(selected, temp_file, append = i > 1L, col.names = i == 1L, na = "")
@@ -78,7 +89,7 @@ knitr::kable(top_cities[, .(`Origin city` = OriginCityName, Records = count_fmt(
 ## Cleaning and time conversion
 
 ```{r validate-and-join, include=FALSE}
-flights <- fread(scoped_file, colClasses = list(character = local_time_cols))
+flights <- fread(scoped_file, colClasses = list(character = char_cols))
 flights <- unique(flights)
 rows_after_dedup <- nrow(flights)
 flight_key <- c(
@@ -123,6 +134,27 @@ flights[, `:=`(
 missing_airports <- length(setdiff(airport_codes, intersect(
   tz_lookup$iata_code, elev_lookup$iata_code
 )))
+
+carrier_lookup <- fread(
+  "carrier_codes.csv",
+  select = c("Code", "Description"),
+  colClasses = "character"
+)[Code %chin% airlines]
+
+stopifnot(
+  !anyDuplicated(carrier_lookup$Code),
+  setequal(carrier_lookup$Code, airlines)
+)
+
+flights[, carrier_name :=
+  carrier_lookup$Description[match(Reporting_Airline, carrier_lookup$Code)]]
+
+stopifnot(
+  invalid_rows == 0L,
+  !anyNA(flights$carrier_name),
+  !anyNA(flights$origin_tz),
+  !anyNA(flights$dest_tz)
+)
 ```
 
 We dropped `r count_fmt(rows_written - rows_after_dedup)` exact duplicate rows.
@@ -217,17 +249,124 @@ flights[, actual_arr_status := check_actual(
   actual_arr_utc, ArrTime, dest_tz[1L]
 ), by = dest_tz]
 
-flights[actual_dep_status != "verified", actual_dep_utc := as_utc(NA_real_)]
-flights[actual_arr_status != "verified", actual_arr_utc := as_utc(NA_real_)]
+# Signed UTC offset in minutes, e.g. -0700 becomes -420.
+offset_minutes <- function(t, zone) {
+  z <- format(t, "%z", tz = zone)
+  sign <- ifelse(substr(z, 1, 1) == "-", -1L, 1L)
+  sign * (60L * as.integer(substr(z, 2, 3)) +
+            as.integer(substr(z, 4, 5)))
+}
+
+# Try a one-hour adjustment only if the airport actually moved
+# its clock back and the adjusted instant matches the reported HHMM.
+fall_candidate <- function(scheduled, candidate, raw_clock, zone) {
+  shifted <- candidate + 3600
+  offset_change <- offset_minutes(scheduled, zone) -
+    offset_minutes(shifted, zone)
+
+  ok <- offset_change == 60L &
+    shifted >= scheduled &
+    format(shifted, "%H%M", tz = zone) == hhmm_normal(raw_clock)
+
+  shifted[!(ok %in% TRUE)] <- as_utc(NA_real_)
+  shifted
+}
+
+# Preserve the first-pass results for the final audit.
+flights[, `:=`(
+  dep_status_initial = actual_dep_status,
+  arr_status_initial = actual_arr_status
+)]
+
+flights[actual_dep_status == "conflict",
+  actual_dep_utc := fall_candidate(
+    sched_dep_utc, actual_dep_utc, DepTime, origin_tz[1L]
+  ), by = origin_tz]
+
+flights[actual_arr_status == "conflict",
+  actual_arr_utc := fall_candidate(
+    sched_arr_utc, actual_arr_utc, ArrTime, dest_tz[1L]
+  ), by = dest_tz]
+
+# Only clock-matched endpoints can support a duration comparison.
+flights[!(dep_status_initial %chin% c("verified", "conflict")),
+        actual_dep_utc := as_utc(NA_real_)]
+flights[!(arr_status_initial %chin% c("verified", "conflict")),
+        actual_arr_utc := as_utc(NA_real_)]
+
+# Keep this diagnostic even if a candidate is rejected below.
+flights[, elapsed_gap_min :=
+  as.numeric(difftime(actual_arr_utc, actual_dep_utc, units = "mins")) -
+    ActualElapsedTime]
+
+for (side in c("dep", "arr")) {
+  status <- paste0("actual_", side, "_status")
+  utc <- paste0("actual_", side, "_utc")
+  initial <- paste0(side, "_status_initial")
+
+  idx <- which(flights[[initial]] == "conflict" & !is.na(flights[[utc]]))
+
+  if (length(idx)) {
+    gap <- flights$elapsed_gap_min[idx]
+    set(flights, i = idx, j = status, value = fcase(
+      is.na(gap), "dst_clock_only",
+      gap == 0,   "verified_dst",
+      default =   "dst_elapsed_conflict"
+    ))
+  }
+
+  flights[!(get(status) %chin% c("verified", "verified_dst")),
+          (utc) := as_utc(NA_real_)]
+}
 ```
 
-For `r count_fmt(sum(!flights$sched_arr_verified))` flights, the scheduled
-arrival clock time and the reported scheduled duration did not agree.
-We left the derived arrival time blank for these flights and kept the original
-record. We also kept cancelled flights and negative delay values, which
-represent early departures or arrivals. A blank actual UTC time can reflect
-an unrecorded time or a time that could not be verified. The status columns
-identify the reason.
+### How to read the time checks
+
+We checked the calculated UTC times against the local clock times in the
+original data. Each check uses the time zone of the airport where the event
+occurred.
+
+**Scheduled arrival.** We added the scheduled elapsed time (`CRSElapsedTime`)
+to `sched_dep_utc`, converted the result to the destination's local time, and
+compared the clock time with `CRSArrTime`. If they matched, we kept the result
+in `sched_arr_utc` and set `sched_arr_verified` to `TRUE`. For the
+`r count_fmt(sum(!flights$sched_arr_verified))` flights with `FALSE`, we left
+` sched_arr_utc` blank and kept the reported local time in `CRSArrTime`.
+
+**Actual departure and arrival.** We first added `DepDelay` or `ArrDelay` to
+the corresponding scheduled UTC time. Then we converted the result to local
+time and compared it with `DepTime` or `ArrTime`. The columns
+`dep_status_initial` and `arr_status_initial` record this first check.
+A value of `conflict` means the calculated and reported local clock times
+differed. This value can still appear in the initial columns after a successful
+correction.
+
+The final results are in `actual_dep_status` and `actual_arr_status`.
+
+- `verified` means the calculated time matched the reported local clock on
+  the first check.
+- `verified_dst` means a one-hour adjustment for the fall clock change matched
+  the reported local clock, and the resulting gate-to-gate duration agreed with
+  `ActualElapsedTime`.
+- `not_recorded` means the original local clock time was missing.
+- `unverified` means a local clock was recorded, but the information needed to
+  verify its UTC time was missing or invalid.
+- `dst_elapsed_conflict` means the adjustment matched the local clock, but the
+  resulting duration differed from `ActualElapsedTime`. If the duration check
+  cannot be completed, the status is `dst_clock_only`.
+
+The CSV keeps `actual_dep_utc` and `actual_arr_utc` when their final status is
+`verified` or `verified_dst`. The column `elapsed_gap_min` records the duration
+implied by the candidate UTC times minus the reported `ActualElapsedTime`.
+A value of zero means the durations agree. A positive value means the
+calculated duration is longer, and a blank means the comparison could not be
+made. The gap is kept even when a candidate UTC time is rejected.
+
+In this dataset, five actual timestamps across three flights failed the
+first check. We verified four after accounting for the fall clock change.
+For AA 1311, the candidate arrival time implied 258 minutes from departure
+to arrival, while the reported duration was 198 minutes. Its
+`elapsed_gap_min` is 60, and `actual_arr_utc` is blank.
 
 ## Analysis file
 
@@ -243,6 +382,14 @@ flights[, split := fcase(
   default = NA_character_
 )]
 stopifnot(nrow(flights) == rows_after_dedup, !anyNA(flights$split))
+flights[, `:=`(
+  use_cancel = Cancelled %in% c(0L, 1L),
+  use_dep_delay = Cancelled == 0L & !is.na(DepDelay),
+  use_arr_delay = Cancelled == 0L & !is.na(ArrDelay),
+  use_elapsed = Cancelled == 0L &
+    !is.na(actual_dep_utc) & !is.na(actual_arr_utc) &
+    !is.na(elapsed_gap_min) & elapsed_gap_min == 0
+)]
 fwrite(flights, "flights_cleaned.csv", na = "", dateTimeAs = "ISO")
 
 split_counts <- flights[, .(
@@ -252,9 +399,70 @@ split_counts <- flights[, .(
 knitr::kable(split_counts, align = "lrr", caption = "Flight records by data split.")
 ```
 
-Use `flights_cleaned.csv` for exploratory analysis and modeling. The file
-contains `r count_fmt(nrow(flights))` flight records and `r ncol(flights)` columns.
+### Using the analysis file
+
+Use `flights_cleaned.csv` for exploratory analysis and modeling. It contains
+`r count_fmt(nrow(flights))` flight records and `r ncol(flights)` columns.
+The `split` column identifies the training (`train`), validation
+(`validation`), and test (`test`) sets.
+
+For each analysis, keep the rows where the corresponding flag is `TRUE`.
+
+- `use_cancel` includes flights with a recorded cancellation status of 0 or 1.
+  Both cancelled and non-cancelled flights are included.
+- `use_dep_delay` includes non-cancelled flights with a recorded `DepDelay`.
+- `use_arr_delay` includes non-cancelled flights with a recorded `ArrDelay`.
+  Both delay columns are in minutes. Negative values indicate early departure
+  or arrival.
+- `use_elapsed` includes non-cancelled flights with both actual UTC times
+  available and `elapsed_gap_min` equal to zero. Use these rows to analyze
+  verified gate-to-gate elapsed time.
+
+A flight can qualify for one analysis and be excluded from another. For example,
+AA 1311 has a reported arrival delay, so `use_arr_delay` is `TRUE`. Its actual
+arrival UTC could not be verified, so `use_elapsed` is `FALSE`.
+
 For predictions made before departure, use information available at prediction
-time, such as scheduled times and airport information. Actual timestamps,
-observed delays, and taxi times are historical outcomes.
+time, such as the airline, airports, flight date, and scheduled times. Use the
+`use_*` flags to select rows and `split` to assign data sets. Actual times,
+observed delays, and taxi times are available for defining outcomes and
+describing historical flights.
+
+
+```{r final-audit, echo=FALSE}
+# Coverage and analysis eligibility by year
+flights[, .(
+  records = .N,
+  cancelled = sum(Cancelled == 1L, na.rm = TRUE),
+  scheduled_arr_unverified = sum(!sched_arr_verified),
+  usable_dep_delay = sum(use_dep_delay),
+  usable_arr_delay = sum(use_arr_delay),
+  usable_elapsed = sum(use_elapsed)
+), by = .(Year, split)][order(Year, split)] |>
+  print()
+
+# Show all flights that had an actual-clock conflict on the first pass
+flights[
+  dep_status_initial == "conflict" | arr_status_initial == "conflict",
+  .(FlightDate, Reporting_Airline, Flight_Number_Reporting_Airline,
+    Origin, Dest, actual_dep_status, actual_arr_status, elapsed_gap_min)
+] |> print()
+
+# Final status and exported UTC availability must agree
+accepted <- c("verified", "verified_dst")
+stopifnot(
+  all(!is.na(flights$actual_dep_utc) ==
+        (flights$actual_dep_status %chin% accepted)),
+  all(!is.na(flights$actual_arr_utc) ==
+        (flights$actual_arr_status %chin% accepted)),
+  all(!is.na(flights$sched_arr_utc) == flights$sched_arr_verified)
+)
+```
+
+
+
+
+
+
+
 
