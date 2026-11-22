@@ -37,7 +37,7 @@ if (length(missing_files)) {
   stop("Missing files: ", paste(missing_files, collapse = ", "))
 }
 
-airlines <- c("WN", "AA", "DL", "UA")
+airlines <- c("F9", "AA", "DL", "UA")
 in_scope <- function(x) {
   x$Reporting_Airline %chin% airlines & (is.na(x$Diverted) | x$Diverted != 1L)
 }
