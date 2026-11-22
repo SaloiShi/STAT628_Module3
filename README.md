@@ -15,7 +15,7 @@ For a passenger flying with one of our selected airlines from a busy origin city
 - September–November 2025.
 
 ### Flight Corp Range
-We selected four airlines—**Southwest, American, Delta, and United（WN, AA, DL, and UA）**—and combined their data across all three years. We excluded rows where Diverted = 1, then selected the top 10 origin cities with the highest record counts in the remaining data for these four airlines.
+We selected four airlines—**Frontier, American, Delta, and United（F9, AA, DL, and UA）**—and combined their data across all three years. We excluded rows where Diverted = 1, then selected the top 10 origin cities with the highest record counts in the remaining data for these four airlines.
 
 ## Our data plan is as follows:
 - Training set: Combine September–November data from 2023 and 2024 to train the baseline model.
