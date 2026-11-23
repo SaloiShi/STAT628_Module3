@@ -1,0 +1,296 @@
+---
+title: "STAT 628: Departure and Arrival Delay Analysis"
+subtitle: "Descriptive Statistics, Predictive Models, and Uncertainty Using Observed Flight Data"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+documentclass: ctexart
+header-includes:
+  - \ctexset{contentsname={Contents}}
+  - \renewcommand{\tablename}{Table}
+  - \renewcommand{\figurename}{Figure}
+params:
+  data_path: flights_cleaned.csv
+  output_dir: delay_outputs
+  run_models: false
+---
+
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; line-height: 1.7; }
+table { display: block; overflow-x: auto; max-width: 100%; font-size: 12px; }
+img { max-width: 100%; }
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+source("R/delay_analysis.R")
+check_packages()
+if (isTRUE(params$run_models)) {
+  run_delay_analysis(params$data_path, params$output_dir)
+}
+out <- params$output_dir
+if (!file.exists(file.path(out, "models", "DepDelay_bundle.rds"))) {
+  stop("Run run_delay_analysis.R first, or set the run_models parameter to true.")
+}
+read_table <- function(name) data.table::fread(file.path(out, "tables", name))
+show_table <- function(name, digits = 3) {
+  tab <- read_table(name)
+  if (!knitr::is_latex_output()) return(knitr::kable(tab, digits = digits))
+  # Keep the full CSV unchanged; PDF pages show the principal metrics.
+  omit <- if (grepl("^eda_", name))
+    c("sd", "p05", "p90", "strict_late_rate", "late60_rate") else
+    c("raw_coverage90", "calibration_expansion", "log_loss", "specificity", "accuracy")
+  tab <- tab[, setdiff(names(tab), omit), with = FALSE]
+  latex <- knitr::kable(tab, format = "latex", digits = digits)
+  knitr::asis_output(paste0(
+    "\\begingroup\n\\small\n\\setlength{\\tabcolsep}{3pt}\n\\sbox0{%\n",
+    latex, "\n}\n\\noindent\\ifdim\\wd0>\\linewidth",
+    "\\resizebox{\\linewidth}{!}{\\usebox0}\\else\\usebox0\\fi\n\\par\\endgroup\n"))
+}
+fig <- function(name) knitr::include_graphics(file.path(out, "figures", paste0(name, ".png")))
+dep <- readRDS(file.path(out, "models", "DepDelay_bundle.rds"))
+arr <- readRDS(file.path(out, "models", "ArrDelay_bundle.rds"))
+```
+
+# Research Questions and Definitions
+
+This analysis addresses two questions: whether a passenger's flight will leave the gate later than scheduled and whether it will arrive at the gate later than scheduled. It also predicts departure and arrival delays in minutes. Both `DepDelay` and `ArrDelay` retain their signs: negative values indicate an early departure or arrival, zero indicates exactly on schedule, and positive values indicate a late departure or arrival.
+
+To avoid ambiguity in the meaning of "on time," this analysis reports:
+
+- **Strictly on time**: delay <= 0 minutes; the probability of any lateness is P(delay > 0).
+- **On time under the 15-minute definition**: delay < 15 minutes; the probability of a substantial delay is P(delay >= 15). The 15-minute threshold follows the U.S. Department of Transportation definition for on-time arrivals. The same threshold is applied to departures for comparability.
+- **Predicted signed delay in minutes**: predictions cover all eligible non-cancelled flights. Early flights are not excluded, and negative values are not replaced with zero. This prediction is not the conditional mean waiting time given that a flight is already known to be late.
+
+All predictions are conditional on a flight being **non-cancelled, non-diverted, and having a recorded value for the relevant delay**. They do not replace the cancellation probabilities estimated by another team member. Overall reliability, including cancellations, should be presented jointly with the cancellation model.
+
+# Data and Temporal Splits
+
+The data come from the 11 monthly raw CSV files in the project folder and are imported, scoped, cleaned, and exported by `01_clean_flights.Rmd`. The airlines are F9, AA, DL, and UA. Following the team's agreed scope, diverted flights are excluded, and the top 10 origin cities are selected by record count across all study months.
+
+```{r source-inventory}
+if (file.exists(file.path(out, "tables", "raw_file_inventory.csv"))) {
+  inventory <- read_table("raw_file_inventory.csv")
+  knitr::kable(inventory[, .(file, raw_rows, date_start, date_end)],
+               caption = sprintf("Raw data actually imported: %s records in total.", format(sum(inventory$raw_rows), big.mark = ",")))
+}
+```
+
+```{r audit}
+show_table("data_audit.csv", 0)
+```
+
+The training set contains September-November 2023 and 2024; the validation set contains December of those two years; and the test set contains September-November 2025. The validation set is further split by day of month: days 1-20 are used for tuning, and days 21-31 are reserved for prediction interval calibration. This prevents the same observations from being used for both model selection and interval calibration. The test set is not used for fitting, tuning, or calibration.
+
+To limit runtime on a personal computer, model training and tuning may use random subsamples drawn with fixed seeds. The tables below report the numbers used and available in this run. Descriptive statistics and test scoring are not restricted by the training sample cap.
+
+```{r sample-counts}
+show_table("DepDelay_sample_counts.csv", 0)
+show_table("ArrDelay_sample_counts.csv", 0)
+```
+
+The top 10 cities are defined using record counts that include 2025, consistent with the team's scope definition. Consequently, the test evaluation is an out-of-time assessment within the agreed study scope, rather than an assessment of a city-selection procedure based entirely on the training period. A future extension could freeze the city list using training-period data only.
+
+# Descriptive Statistics
+
+This section retains one summary table and three figures covering the overall delay distribution, airline differences, and differences by scheduled departure hour. It uses all eligible historical records from 2023-2024, reserving 2025 for final testing. Negative and extreme delays are retained; plot zooming affects only the display.
+
+## Overall Delay Levels and Distributions
+
+```{r overall}
+a <- read_table("eda_overall.csv")
+compact_summary <- data.frame(
+  Task = ifelse(a$outcome == "DepDelay", "Departure", "Arrival"),
+  Flights = format(a$n, big.mark = ",", scientific = FALSE, trim = TRUE),
+  Mean = round(a$mean, 2),
+  Median = a$median,
+  `95th percentile` = a$p95,
+  `Delay rate` = sprintf("%.1f%%", 100 * a$late15_rate),
+  check.names = FALSE
+)
+knitr::kable(compact_summary, caption = "Core descriptive statistics: time is measured in minutes; the delay rate is the proportion delayed by at least 15 minutes.")
+```
+
+```{r distribution}
+fig("01_delay_distribution")
+```
+
+For both outcomes, the median is negative while the mean is higher. Thus, a typical flight may be early, but a small number of long delays substantially increase the mean. Modeling should therefore preserve negative values and address typical delays, long-delay risk, and prediction intervals. Evaluation reports both MAE and RMSE.
+
+## Delay Risk Across Airlines
+
+```{r airline-risk}
+a <- read_table("eda_by_airline.csv")
+a[, outcome_label := ifelse(outcome == "DepDelay", "Departure", "Arrival")]
+p <- ggplot2::ggplot(a, ggplot2::aes(Reporting_Airline, late15_rate)) +
+  ggplot2::geom_col(fill = "#167d9a", width = .65) +
+  ggplot2::geom_text(ggplot2::aes(label = sprintf("%.1f%%", 100 * late15_rate)),
+                     vjust = -.4, size = 3.5) +
+  ggplot2::facet_wrap(~outcome_label) +
+  ggplot2::scale_y_continuous(labels = function(v) paste0(round(100*v), "%"),
+    expand = ggplot2::expansion(mult = c(0, .15))) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::labs(title = "Historical delay risk by airline", x = "Airline",
+    y = "P(delay >= 15 min)",
+    caption = "2023-2024 eligible flights; unadjusted historical comparisons.")
+save_plot(p, "02_airline_delay_risk", out, height = 4)
+fig("02_airline_delay_risk")
+```
+
+```{r airline-findings, results='asis'}
+for (v in c("DepDelay", "ArrDelay")) {
+  b <- a[outcome == v][order(late15_rate)]
+  lo <- b[1]; hi <- b[.N]
+  cat(sprintf("\n\nFor %s, the lowest historical rate of delays of at least 15 minutes is **%s (%.1f%%)**, and the highest is **%s (%.1f%%)**.", if (v == "DepDelay") "departures" else "arrivals", lo$Reporting_Airline, 100*lo$late15_rate, hi$Reporting_Airline, 100*hi$late15_rate))
+}
+```
+
+These differences support including airline as a predictor. They cannot be interpreted directly as causal differences in operational efficiency, because the airlines serve different mixes of airports, routes, and scheduled times.
+
+## Scheduled Departure Hour and Delay Risk
+
+```{r departure-hour}
+fig("04_risk_hour")
+```
+
+```{r hour-findings, results='asis'}
+h <- read_table("eda_by_hour.csv")
+for (v in c("DepDelay", "ArrDelay")) {
+  morning <- h[outcome == v & hour %in% 5:8]
+  evening <- h[outcome == v & hour %in% 18:21]
+  early_rate <- weighted.mean(morning$late15_rate, morning$n)
+  late_rate <- weighted.mean(evening$late15_rate, evening$n)
+  cat(sprintf("\n\nAmong flights scheduled to depart at **05:00-08:59 local time**, the rate of %s delays of at least 15 minutes is **%.1f%%**; the corresponding rate for departures at **18:00-21:59** is **%.1f%%**.", if (v == "DepDelay") "departure" else "arrival", 100*early_rate, 100*late_rate))
+}
+```
+
+Differences across departure hours indicate that scheduled departure time has predictive value. These are historical associations; they do not establish that changing the departure time would necessarily change the delay of the same flight. Hour-specific rates for the small number of flights in the early morning should also not be overinterpreted.
+
+Detailed results for cities, weekdays, years/months, and the relationship between departure and arrival delays remain available in `delay_outputs/tables` and `delay_outputs/figures`, but are no longer displayed individually in the main report. This shorter presentation does not change the predictors, model fitting, or test results.
+
+# Model Design
+
+## Information Available at Prediction Time
+
+Inputs include airline, origin and destination airports, flight date, weekday, a weekend indicator, month, year, day of month, scheduled local departure and arrival times, scheduled elapsed time, and, where available, distance and the elevations of both airports. Time of day is also encoded using sine and cosine terms to reflect continuity around midnight. Rare airport categories are pooled, and missing numeric values are imputed using training-set medians.
+
+Actual departure and arrival times, `DepDelay`, `ArrDelay`, `TaxiOut`, `TaxiIn`, `AirTime`, `ActualElapsedTime`, cancellation reasons, and observed delay-cause variables are excluded from the predictors. UTC timestamps reconstructed from observed delays are also excluded.
+
+## Candidate Models and Selection Rules
+
+- **Delay in minutes**: training-median and training-mean baselines, linear regression, random forest mean predictions, and quantile random forest median predictions. The final point predictor is selected by the lowest tuning-set MAE. RMSE and bias are also reported to assess errors in the long tail.
+- **Probabilities**: training-period prevalence baselines, logistic regression, and multiclass probability random forests. The forest classes are early, exactly on schedule, 1-14 minutes late, and at least 15 minutes late, allowing probabilities under both definitions to be obtained. The final probability model is selected by the lowest tuning-set Brier score for the 15-minute threshold. If the two logistic regression probabilities violate the nesting relationship, they are projected to the same value.
+- Random forests are compared over a grid of two node sizes and two fractions of candidate predictors. An ordinary logarithmic transformation is not applied to delay minutes because delays can be negative. The final model is not assumed to outperform the baselines; selection is determined by observed validation performance.
+
+For each outcome, the probability model and the model for delay minutes may differ. A rule such as "predicted delay >= 15 minutes" is not a substitute for a delay probability. A predicted mean or median is not a certain outcome for an individual flight.
+
+If the median predictor is selected, it describes the conditional location of a typical flight and should not be described as the expected mean delay. In a long-tailed distribution, a median model can have lower MAE while also exhibiting negative mean prediction bias. Validation scores for mean predictors are therefore retained for comparison. All bias measures are defined as predicted minus observed.
+
+```{r forest-grid}
+if (file.exists(file.path(out, "tables", "DepDelay_forest_grid.csv")))
+  show_table("DepDelay_forest_grid.csv")
+```
+
+```{r validation}
+show_table("DepDelay_validation_regression.csv")
+show_table("DepDelay_validation_classification.csv")
+show_table("ArrDelay_validation_regression.csv")
+show_table("ArrDelay_validation_classification.csv")
+```
+
+Selected models in this run: the departure point predictor is **`r dep$point_choice`**, and its probability model is **`r dep$class_choice`**; the arrival point predictor is **`r arr$point_choice`**, and its probability model is **`r arr$class_choice`**.
+
+## Uncertainty for an Individual Flight
+
+The quantile forest first estimates the 5th and 95th percentiles. The interval is then widened using deviation scores from the independent calibration set. Calibration uses a finite-sample order statistic, targeting 90% coverage. This is a **prediction interval for an individual flight outcome**, not a confidence interval for the mean delay. Predicted probabilities describe event uncertainty; their reliability is assessed using the Brier score and calibration plots.
+
+Flights can share weather shocks on the same day, and conditions can shift across years and seasons. Calibration observations and future observations therefore cannot be assumed to be fully exchangeable. The 90% level is a nominal target, not a coverage guarantee for every airport, every day, or December 2025. Overall and subgroup test coverage provide the relevant empirical evidence.
+
+# Test Results for 2025
+
+## Departure Delay
+
+```{r departure-results}
+show_table("DepDelay_test_regression.csv")
+show_table("DepDelay_test_classification.csv")
+fig("DepDelay_07_test_calibration")
+fig("DepDelay_08_test_residuals")
+fig("DepDelay_09_test_intervals")
+```
+
+```{r departure-interpretation, results='asis'}
+v <- read_table("DepDelay_test_regression.csv")[1]
+c <- read_table("DepDelay_test_classification.csv")[threshold == 15][1]
+cat(sprintf("For departure delay minutes, test MAE is **%.2f minutes** and RMSE is **%.2f minutes**. The empirical coverage of the 90%% prediction intervals is **%.1f%%**, with a mean width of **%.1f minutes**. For the probability of a delay of at least 15 minutes, the Brier score is **%.4f** and AUC is **%.3f**.", v$MAE, v$RMSE, 100*v$coverage90, v$mean_width90, c$Brier, c$AUC))
+base <- read_table("DepDelay_test_regression.csv")[model == "train_median"][1]
+cat(sprintf("\n\nRelative to the training-median baseline, MAE improves by **%.2f%%**. At the default classification threshold of 0.5, sensitivity (recall) for delays of at least 15 minutes is **%.2f%%**. Performance should therefore be assessed jointly using AUC, the Brier score, and baseline comparisons, rather than accuracy alone.", 100*(base$MAE-v$MAE)/base$MAE, 100*c$sensitivity))
+```
+
+## Arrival Delay
+
+```{r arrival-results}
+show_table("ArrDelay_test_regression.csv")
+show_table("ArrDelay_test_classification.csv")
+fig("ArrDelay_07_test_calibration")
+fig("ArrDelay_08_test_residuals")
+fig("ArrDelay_09_test_intervals")
+```
+
+```{r arrival-interpretation, results='asis'}
+v <- read_table("ArrDelay_test_regression.csv")[1]
+c <- read_table("ArrDelay_test_classification.csv")[threshold == 15][1]
+cat(sprintf("For arrival delay minutes, test MAE is **%.2f minutes** and RMSE is **%.2f minutes**. The empirical coverage of the 90%% prediction intervals is **%.1f%%**, with a mean width of **%.1f minutes**. For the probability of a delay of at least 15 minutes, the Brier score is **%.4f** and AUC is **%.3f**.", v$MAE, v$RMSE, 100*v$coverage90, v$mean_width90, c$Brier, c$AUC))
+base <- read_table("ArrDelay_test_regression.csv")[model == "train_median"][1]
+cat(sprintf("\n\nRelative to the training-median baseline, MAE improves by **%.2f%%**. At the default classification threshold of 0.5, sensitivity (recall) for delays of at least 15 minutes is **%.2f%%**.", 100*(base$MAE-v$MAE)/base$MAE, 100*c$sensitivity))
+```
+
+Residual plots assess whether errors vary with predicted values and whether long delays are underestimated. Calibration plots closer to the diagonal indicate greater agreement between probabilities and observed frequencies. Interval plots show the first 80 test flights ordered by date and original row order, avoiding selective presentation of favorable examples. Reliability should still be judged using the full test results.
+
+In the interval plots, dark blue dots show point predictions, light blue vertical lines show prediction intervals, and colored dots show observed delays. The dot colors indicate whether the observed value falls inside the interval.
+
+If delay recall is low at the default 0.5 threshold, high accuracy alone does not support a claim that the model identifies most delayed flights effectively. A passenger-facing application should display delay probabilities and intervals. If an action threshold is needed, it should be chosen on validation data based on the costs of false alarms and missed delays, rather than selected using test results.
+
+## Subgroup Robustness
+
+```{r subgroup-results}
+show_table("DepDelay_test_by_airline.csv")
+show_table("ArrDelay_test_by_airline.csv")
+show_table("DepDelay_test_by_origin.csv")
+show_table("ArrDelay_test_by_origin.csv")
+```
+
+Subgroup results should be checked for airlines and airports with larger errors or lower coverage. Metrics for small groups may be unstable. Forest permutation importance and baseline regression coefficients are saved separately in `tables`. Importance measures describe predictive dependence, not causal effects. Conventional standard errors from the baseline regressions do not account for within-day dependence and are not used to establish significant causal differences between airlines.
+
+```{r feature-importance}
+paths <- file.path(out, "figures", paste0(c("DepDelay", "ArrDelay"), "_10_forest_importance.png"))
+if (any(file.exists(paths))) knitr::include_graphics(paths[file.exists(paths)])
+```
+
+The figures show the retained forest candidates' predictive dependence on the variables. Correlated variables may share importance, and the numerical scales are not directly comparable between the probability and delay-minute tasks. If a baseline regression is selected, forest importance should not be interpreted as parameters of the final regression model.
+
+# December 2025 Predictions and Application Integration
+
+`models/DepDelay_bundle.rds` and `models/ArrDelay_bundle.rds` contain the frozen preprocessing, models, and interval calibration information. Calling `predict_delay()` produces predictions for an actual future flight schedule without requiring observed delays. The function returns probabilities of any lateness and of delays of at least 15 minutes, corresponding on-time probabilities, signed delay minutes, and prediction intervals. Airports or airlines outside the training scope are flagged and should not be treated as validated in-scope predictions.
+
+Training covers only September-November: the forests cannot learn December-specific effects absent from the training data. December validation can only help select models that transfer better and calibrate intervals. Testing on September-November 2025 also does not directly establish accuracy for December 2025. The retained models are frozen versions used for an honest test evaluation. If a production model is subsequently refitted using all known months, it should be saved as a separate version with independent temporal calibration data. The existing model's calibration expansion should not be transferred directly to a newly fitted model.
+
+This analysis does not incorporate weather forecasts available at prediction time, the status of the preceding flight leg, or real-time airport congestion. Extreme delays remain difficult to predict precisely. No actual December 2025 flight schedule has been supplied, so no fictional flights are generated as "December prediction results."
+
+# Methodological References
+
+- [U.S. Department of Transportation: the 15-minute definition of on-time arrival](https://www.transportation.gov/sites/dot.gov/files/docs/CFR-2012-title14-vol4%20Part%20200%20DOT.pdf).
+- [Official ranger documentation: probability and quantile forests](https://imbs-hl.github.io/ranger/reference/ranger.html).
+- [Official ranger prediction interface](https://imbs-hl.github.io/ranger/reference/predict.ranger.html).
+- [Romano et al. (2019), Conformalized Quantile Regression](https://arxiv.org/abs/1905.03222).
+
+```{r session, echo=FALSE}
+sessionInfo()
+```
