@@ -26,104 +26,60 @@ theme_set(theme_minimal(base_size = 10))
 count_fmt <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
 ```
 
-## Data Check
 ```{r}
+#| label: load-data
+
 file_path <- "flights_cleaned.csv"
-raw_names <- names(fread(file_path, nrows = 0L))
 
-pick_col <- function(candidates) {
-  hit <- candidates[tolower(candidates) %in% tolower(raw_names)]
-  if (length(hit) == 0L) return(NA_character_)
-  raw_names[match(tolower(hit[1L]), tolower(raw_names))]
-}
-
-col_map <- c(
-  Year              = pick_col(c("Year")),
-  Month             = pick_col(c("Month")),
-  DayOfWeek         = pick_col(c("DayOfWeek", "day_of_week")),
-  FlightDate        = pick_col(c("FlightDate", "flight_date")),
-  Reporting_Airline = pick_col(c("Reporting_Airline", "reporting_airline")),
-  Origin            = pick_col(c("Origin", "origin")),
-  OriginCityName    = pick_col(c("OriginCityName", "origincityname")),
-  Dest              = pick_col(c("Dest", "dest")),
-  DestCityName      = pick_col(c("DestCityName", "destcityname")),
-  DepDelay          = pick_col(c("DepDelay", "depdelay")),
-  ArrDelay          = pick_col(c("ArrDelay", "arrdelay")),
-  TaxiOut           = pick_col(c("TaxiOut", "taxiout")),
-  TaxiIn            = pick_col(c("TaxiIn", "taxiin")),
-  AirTime           = pick_col(c("AirTime", "airtime")),
-  ActualElapsedTime = pick_col(c("ActualElapsedTime", "actualelapsedtime")),
-  CRSElapsedTime    = pick_col(c("CRSElapsedTime", "crselapsedtime")),
-  Cancelled         = pick_col(c("Cancelled", "cancelled")),
-  NASDelay          = pick_col(c("NASDelay", "nasdelay")),
-  TotalAddGTime     = pick_col(c("TotalAddGTime", "totaladdgtime"))
+keep_cols <- c(
+  "Year", "Month", "DayofMonth", "DayOfWeek", "FlightDate", "CRSDepTime",
+  "Reporting_Airline", "carrier_name",
+  "Origin", "OriginCityName", "OriginState",
+  "Dest", "DestCityName", "DestStateName",
+  "DepDelay", "TaxiOut", "TaxiIn", "ArrDelay",
+  "AirTime", "ActualElapsedTime", "CRSElapsedTime",
+  "Cancelled", "Diverted",
+  "CarrierDelay", "WeatherDelay", "NASDelay", "SecurityDelay", "LateAircraftDelay", "TotalAddGTime",
+  "split", "use_cancel", "use_dep_delay", "use_arr_delay", "use_elapsed"
 )
 
-valid_cols <- unname(na.omit(col_map))
-dt <- fread(file_path, select = valid_cols)
-setnames(dt, old = valid_cols, new = names(col_map)[!is.na(col_map)])
-
-if (!"Year" %in% names(dt) || !"Month" %in% names(dt)) {
-  dt[, FlightDate_parsed := as.IDate(FlightDate)]
-  dt[, `:=`(Year = year(FlightDate_parsed), Month = month(FlightDate_parsed))]
-}
+dt <- fread(file_path, select = keep_cols)
 ```
 
-## General Distribution
+
+## Overview: Does Taxi In/Out Time Affect the Delay Time?
 ```{r}
+#| label: dist-prep
+
 active_dt <- dt[Cancelled == 0L & !is.na(TaxiOut) & !is.na(TaxiIn)]
 
 stats_dt <- data.table(
-  Phase  = c("Taxi-Out", "Taxi-In"),
+  Phase  = factor(c("Taxi-Out", "Taxi-In"), levels = c("Taxi-Out", "Taxi-In")),
   Mean   = c(mean(active_dt$TaxiOut), mean(active_dt$TaxiIn)),
   Median = c(as.numeric(median(active_dt$TaxiOut)), as.numeric(median(active_dt$TaxiIn))),
   P90    = c(as.numeric(quantile(active_dt$TaxiOut, 0.90)), as.numeric(quantile(active_dt$TaxiIn, 0.90))),
   P95    = c(as.numeric(quantile(active_dt$TaxiOut, 0.95)), as.numeric(quantile(active_dt$TaxiIn, 0.95)))
 )
 
-p995_out <- quantile(active_dt$TaxiOut, 0.995)
-p995_in  <- quantile(active_dt$TaxiIn, 0.995)
-
 plot_dt <- rbind(
-  data.table(Phase = "Taxi-Out", Minutes = active_dt[TaxiOut <= p995_out, TaxiOut]),
-  data.table(Phase = "Taxi-In",  Minutes = active_dt[TaxiIn  <= p995_in,  TaxiIn])
-)
-plot_dt[, Phase := factor(Phase, levels = c("Taxi-Out", "Taxi-In"))]
-stats_dt[, Phase := factor(Phase, levels = c("Taxi-Out", "Taxi-In"))]
+  data.table(Phase = "Taxi-Out", Minutes = active_dt[TaxiOut <= quantile(TaxiOut, 0.995), TaxiOut]),
+  data.table(Phase = "Taxi-In",  Minutes = active_dt[TaxiIn  <= quantile(TaxiIn,  0.995), TaxiIn])
+)[, Phase := factor(Phase, levels = c("Taxi-Out", "Taxi-In"))]
 ```
 
-
 ```{r}
+#| label: general-hist
+#| fig-height: 3.6
+#| fig-width: 7.0
+
 ggplot(plot_dt, aes(x = Minutes)) +
-  geom_histogram(
-    aes(y = after_stat(density)),
-    binwidth = 2,
-    boundary = 0,
-    fill = "#4a7ebb",
-    color = "white",
-    linewidth = 0.25,
-    alpha = 0.85
-  ) +
-  geom_vline(
-    data = stats_dt,
-    aes(xintercept = Median, color = "Median (P50)"),
-    linetype = "solid", linewidth = 0.8
-  ) +
-  geom_vline(
-    data = stats_dt,
-    aes(xintercept = P90, color = "P90"),
-    linetype = "dashed", linewidth = 0.8
-  ) +
-  geom_vline(
-    data = stats_dt,
-    aes(xintercept = P95, color = "P95"),
-    linetype = "dotted", linewidth = 0.9
-  ) +
+  geom_histogram(aes(y = after_stat(density)), binwidth = 2, boundary = 0,
+                 fill = "#4a7ebb", color = "white", linewidth = 0.25, alpha = 0.85) +
+  geom_vline(data = stats_dt, aes(xintercept = Median, color = "Median (P50)"), linewidth = 0.8) +
+  geom_vline(data = stats_dt, aes(xintercept = P90,    color = "P90"),          linetype = "dashed", linewidth = 0.8) +
+  geom_vline(data = stats_dt, aes(xintercept = P95,    color = "P95"),          linetype = "dotted", linewidth = 0.9) +
   facet_wrap(~ Phase, scales = "free") +
-  scale_color_manual(
-    name = "Quantiles",
-    values = c("Median (P50)" = "#2a9d8f", "P90" = "#e76f51", "P95" = "#d62828")
-  ) +
+  scale_color_manual(name = "Quantiles", values = c("Median (P50)" = "#2a9d8f", "P90" = "#e76f51", "P95" = "#d62828")) +
   labs(
     title = "Distribution of Taxi-Out and Taxi-In Times (Up to 99.5th Percentile)",
     subtitle = sprintf(
@@ -131,179 +87,220 @@ ggplot(plot_dt, aes(x = Minutes)) +
       stats_dt$Median[1], stats_dt$Mean[1], stats_dt$P90[1], stats_dt$P95[1],
       stats_dt$Median[2], stats_dt$Mean[2], stats_dt$P90[2], stats_dt$P95[2]
     ),
-    x = "Taxi Duration (Minutes)",
-    y = "Density"
+    x = "Taxi Duration (Minutes)", y = "Density"
   ) +
   theme_minimal(base_size = 10) +
-  theme(
-    legend.position = "bottom",
-    panel.grid.minor = element_blank(),
-    plot.subtitle = element_text(size = 8.5, color = "gray30", lineheight = 1.2)
-  )
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(),
+        plot.subtitle = element_text(size = 8.5, color = "gray30", lineheight = 1.2))
 ```
 
-```{r}
-# 1. 计算分机场基准后的超额滑行时间 (Excess Taxi Time)
-active_dt[, Origin_Med_Out := as.numeric(median(TaxiOut)), by = Origin]
-active_dt[, Dest_Med_In    := as.numeric(median(TaxiIn)),  by = Dest]
-active_dt[, `:=`(
-  ExcessTaxiOut = TaxiOut - Origin_Med_Out,
-  ExcessTaxiIn  = TaxiIn  - Dest_Med_In,
-  TotalTaxi     = TaxiOut + TaxiIn,
-  ExcessTotalTaxi = (TaxiOut - Origin_Med_Out) + (TaxiIn - Dest_Med_In)
-)]
 
-# 2. 相关系数对比表 (Pearson & Spearman)
-cor_summary <- data.table(
-  Predictor = c("TaxiOut (Raw)", "ExcessTaxiOut (vs Airport Median)",
-                "TaxiIn (Raw)", "ExcessTaxiIn (vs Airport Median)",
-                "TotalTaxi (TaxiOut + TaxiIn)", "ExcessTotalTaxi"),
-  Cor_with_DepDelay = c(
-    cor(active_dt$TaxiOut,         active_dt$DepDelay, use = "complete.obs"),
-    cor(active_dt$ExcessTaxiOut,   active_dt$DepDelay, use = "complete.obs"),
-    cor(active_dt$TaxiIn,          active_dt$DepDelay, use = "complete.obs"),
-    cor(active_dt$ExcessTaxiIn,    active_dt$DepDelay, use = "complete.obs"),
-    cor(active_dt$TotalTaxi,       active_dt$DepDelay, use = "complete.obs"),
-    cor(active_dt$ExcessTotalTaxi, active_dt$DepDelay, use = "complete.obs")
-  ),
-  Cor_with_ArrDelay = c(
-    cor(active_dt$TaxiOut,         active_dt$ArrDelay, use = "complete.obs"),
-    cor(active_dt$ExcessTaxiOut,   active_dt$ArrDelay, use = "complete.obs"),
-    cor(active_dt$TaxiIn,          active_dt$ArrDelay, use = "complete.obs"),
-    cor(active_dt$ExcessTaxiIn,    active_dt$ArrDelay, use = "complete.obs"),
-    cor(active_dt$TotalTaxi,       active_dt$ArrDelay, use = "complete.obs"),
-    cor(active_dt$ExcessTotalTaxi, active_dt$ArrDelay, use = "complete.obs")
-  )
+```{r}
+#| label: delay-cor-table
+
+active_dt[, `:=`(
+  ExcessTaxiOut   = TaxiOut - as.numeric(median(TaxiOut)),
+  ExcessTaxiIn    = TaxiIn  - as.numeric(median(TaxiIn)),
+  TotalTaxi       = TaxiOut + TaxiIn
+)]
+active_dt[, `:=`(
+  ExcessTaxiOut   = TaxiOut - as.numeric(median(TaxiOut)),
+  ExcessTotalTaxi = (TaxiOut - as.numeric(median(TaxiOut))) + (TaxiIn - as.numeric(median(TaxiIn)))
+), by = .(Origin, Dest)]
+
+active_dt[, ExcessTaxiOut   := TaxiOut - as.numeric(median(TaxiOut)), by = Origin]
+active_dt[, ExcessTaxiIn    := TaxiIn  - as.numeric(median(TaxiIn)),  by = Dest]
+active_dt[, ExcessTotalTaxi := ExcessTaxiOut + ExcessTaxiIn]
+
+metrics <- list(
+  "TaxiOut (Raw)"                     = active_dt$TaxiOut,
+  "ExcessTaxiOut (vs Airport Median)" = active_dt$ExcessTaxiOut,
+  "TaxiIn (Raw)"                      = active_dt$TaxiIn,
+  "ExcessTaxiIn (vs Airport Median)"  = active_dt$ExcessTaxiIn,
+  "TotalTaxi (TaxiOut + TaxiIn)"      = active_dt$TotalTaxi,
+  "ExcessTotalTaxi"                   = active_dt$ExcessTotalTaxi
 )
 
-cor_summary[, `:=`(
-  Cor_with_DepDelay = round(Cor_with_DepDelay, 3),
-  Cor_with_ArrDelay = round(Cor_with_ArrDelay, 3),
-  R2_ArrDelay_Pct   = round((Cor_with_ArrDelay^2) * 100, 2)
-)]
+cor_summary <- data.table(
+  Predictor         = names(metrics),
+  Cor_with_DepDelay = round(sapply(metrics, cor, y = active_dt$DepDelay, use = "complete.obs"), 3),
+  Cor_with_ArrDelay = round(sapply(metrics, cor, y = active_dt$ArrDelay, use = "complete.obs"), 3)
+)[, R2_ArrDelay_Pct := round((Cor_with_ArrDelay^2) * 100, 2)]
 
 kable(cor_summary, caption = "Correlation Between Taxi Metrics and Departure/Arrival Delays")
 ```
 
-### 基于四大航司的分析
-```{r}
-# 1. 定义四家航司及其对应的总部机场 (ORD, DFW, ATL, DEN)
-hq_airports <- c("ORD", "DFW", "ATL", "DEN")
+Ground taxi durations are virtually independent of gate departure delays (DepDelay, $r = 0.010\text{--}0.042$), yet exhibit a statistically significant positive correlation with final arrival delays (ArrDelay, $r = 0.104\text{--}0.231$). Across operational phases, departure taxi-out (ExcessTaxiOut, $r = 0.200, R^2 = 4.00\%$) accounts for nearly three times the arrival-delay variance of arrival taxi-in (ExcessTaxiIn, $r = 0.116, R^2 = 1.35\%$), identifying pre-departure runway queuing as the primary ground bottleneck. Furthermore, airport-adjusted "excess" metrics consistently outperform raw durations across every phase, with ExcessTotalTaxi alone explaining $5.34\%$ of total arrival delay variance ($r = 0.231$)—demonstrating that congestion exceeding local airport baselines, rather than baseline hub size, directly erodes on-time arrival performance.
 
-active_dt[, `:=`(
-  HQ_Label = fcase(
-    Origin == "ORD", "ORD (UA HQ)",
-    Origin == "DFW", "DFW (AA HQ)",
-    Origin == "ATL", "ATL (DL HQ)",
-    Origin == "DEN", "DEN (F9 HQ)",
-    default = "Non-HQ Airports"
-  ),
-  Location_Type = fifelse(
-    (Reporting_Airline == "UA" & Origin == "ORD") |
-    (Reporting_Airline == "AA" & Origin == "DFW") |
-    (Reporting_Airline == "DL" & Origin == "ATL") |
-    (Reporting_Airline == "F9" & Origin == "DEN"),
-    "Own HQ Airport",
-    "Other Top-10 Airports"
-  )
+```{r}
+#| label: delay-cor-plot
+#| fig-height: 3.8
+#| fig-width: 7.0
+
+cor_plot_dt <- melt(
+  cor_summary[, .(
+    Predictor,
+    `Departure Delay (DepDelay)` = Cor_with_DepDelay,
+    `Arrival Delay (ArrDelay)`   = Cor_with_ArrDelay,
+    R2_ArrDelay_Pct
+  )],
+  id.vars = c("Predictor", "R2_ArrDelay_Pct"),
+  variable.name = "Delay_Type",
+  value.name = "Correlation"
+)
+
+pred_order <- cor_summary[order(Cor_with_ArrDelay)]$Predictor
+cor_plot_dt[, Predictor := factor(Predictor, levels = pred_order)]
+
+cor_plot_dt[, Bar_Label := fifelse(
+  Delay_Type == "Arrival Delay (ArrDelay)",
+  sprintf("r = %.3f (R²: %.2f%%)", Correlation, R2_ArrDelay_Pct),
+  sprintf("r = %.3f", Correlation)
 )]
 
-# 重新计算当前数据集的全局 P90 阈值
-p90_out <- as.numeric(quantile(active_dt$TaxiOut, 0.90))
+cor_plot_dt[, Bar_Category := fcase(
+  Delay_Type == "Departure Delay (DepDelay)", "Departure Delay (All Metrics)",
+  grepl("Excess", Predictor),                 "Arrival Delay (Excess vs. Median)",
+  default =                                   "Arrival Delay (Raw Minutes)"
+)]
 
-# 2. 表 1：四大航司在各自总部机场的滑行表现横向对比
-own_hq_tbl <- active_dt[Location_Type == "Own HQ Airport", .(
-  Flights           = format(.N, big.mark = ","),
-  TaxiOut_Mean      = round(mean(TaxiOut), 2),
-  TaxiOut_Median    = as.numeric(median(TaxiOut)),
-  TaxiOut_IQR       = as.numeric(IQR(TaxiOut)),
-  TaxiOut_P90       = as.numeric(quantile(TaxiOut, 0.90)),
-  Excessive_Out_Pct = round(mean(TaxiOut > p90_out) * 100, 1),
-  TaxiIn_Mean       = round(mean(TaxiIn), 2),
-  Mean_ArrDelay     = round(mean(ArrDelay, na.rm = TRUE), 2)
-), by = .(Reporting_Airline, Origin, OriginCityName)][order(-TaxiOut_Mean)]
-
-kable(own_hq_tbl, caption = "Home-Carrier Taxi Performance at Each Airline's HQ Airport")
-
-# 3. 图 1：哑铃图 —— 对比四家航司在“自家总部” vs “其他 Top 10 机场”的滑出耗时
-dumbbell_dt <- active_dt[, .(
-  Mean_TaxiOut  = round(mean(TaxiOut), 1),
-  Excessive_Pct = round(mean(TaxiOut > p90_out) * 100, 1),
-  Flights       = .N
-), by = .(Reporting_Airline, Location_Type)]
-
-wide_db <- dcast(dumbbell_dt, Reporting_Airline ~ Location_Type, value.var = "Mean_TaxiOut")
-setnames(wide_db, c("Reporting_Airline", "Other", "HQ"))
-
-ggplot() +
-  geom_segment(
-    data = wide_db,
-    aes(x = Other, xend = HQ, y = Reporting_Airline, yend = Reporting_Airline),
-    color = "gray65", linewidth = 1.4
-  ) +
-  geom_point(
-    data = dumbbell_dt,
-    aes(x = Mean_TaxiOut, y = Reporting_Airline, color = Location_Type),
-    size = 4.5
-  ) +
+ggplot(cor_plot_dt, aes(x = Predictor, y = Correlation, fill = Bar_Category)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.64, alpha = 0.92) +
   geom_text(
-    data = dumbbell_dt,
-    aes(x = Mean_TaxiOut, y = Reporting_Airline, label = paste0(Mean_TaxiOut, "m"), color = Location_Type),
-    vjust = -1.1, fontface = "bold", size = 3.5, show.legend = FALSE
+    aes(label = Bar_Label),
+    position = position_dodge(width = 0.72),
+    hjust = -0.08, size = 2.9, fontface = "bold", color = "gray20"
   ) +
-  scale_color_manual(values = c("Own HQ Airport" = "#e76f51", "Other Top-10 Airports" = "#2b5c8f")) +
-  scale_x_continuous(expand = expansion(mult = c(0.12, 0.12))) +
+  coord_flip(ylim = c(0, max(cor_plot_dt$Correlation) * 1.48)) +
+  scale_fill_manual(values = c(
+    "Arrival Delay (Excess vs. Median)" = "#e76f51",
+    "Arrival Delay (Raw Minutes)"       = "#2b5c8f",
+    "Departure Delay (All Metrics)"     = "#a8dadc"
+  )) +
   labs(
-    title = "Does Flying Out of an Airline's HQ Increase Taxi-Out Time?",
-    subtitle = "Mean Taxi-Out duration (minutes): Own HQ Airport vs. Other Top-10 Airports",
-    x = "Mean Taxi-Out Duration (Minutes)",
-    y = "Airline",
-    color = NULL
-  ) +
-  theme_minimal(base_size = 11) +
-  theme(
-    legend.position = "bottom",
-    panel.grid.minor = element_blank(),
-    axis.text.y = element_text(face = "bold", size = 11)
-  )
-
-# 4. 图 2：四大总部机场内部“主场航司 vs 客场航司”横向对比柱状图
-hq_only_dt <- active_dt[Origin %in% hq_airports]
-hq_only_dt[, Is_Home := fifelse(Location_Type == "Own HQ Airport", "Home Carrier (HQ)", "Visiting Carrier")]
-
-hub_bar_dt <- hq_only_dt[, .(
-  Mean_TaxiOut  = round(mean(TaxiOut), 1),
-  Excessive_Pct = round(mean(TaxiOut > p90_out) * 100, 1),
-  Flights       = .N
-), by = .(HQ_Label, Reporting_Airline, Is_Home)]
-
-# 按机场平均滑出时长排序分面
-hub_order <- hub_bar_dt[, .(m = mean(Mean_TaxiOut)), by = HQ_Label][order(-m)]$HQ_Label
-hub_bar_dt[, HQ_Label := factor(HQ_Label, levels = hub_order)]
-
-ggplot(hub_bar_dt, aes(x = reorder(Reporting_Airline, Mean_TaxiOut), y = Mean_TaxiOut, fill = Is_Home)) +
-  geom_col(width = 0.62, alpha = 0.9) +
-  geom_text(
-    aes(label = sprintf("%.1f min (%.1f%% >%dm)", Mean_TaxiOut, Excessive_Pct, p90_out)),
-    hjust = -0.08, size = 3, color = "gray20"
-  ) +
-  coord_flip(ylim = c(0, max(hub_bar_dt$Mean_TaxiOut) * 1.35)) +
-  facet_wrap(~ HQ_Label, ncol = 1, scales = "free_y") +
-  scale_fill_manual(values = c("Home Carrier (HQ)" = "#e76f51", "Visiting Carrier" = "#8ecae6")) +
-  labs(
-    title = "Home vs. Visiting Carriers Inside Each of the Four HQ Airports",
-    subtitle = sprintf("Bar length = Mean Taxi-Out; label shows mean and %% exceeding global P90 (%d min)", p90_out),
+    title = "Correlation of Raw vs. Airport-Adjusted Taxi Metrics with Flight Delays",
+    subtitle = "Airport-adjusted 'Excess' metrics (orange) consistently outperform raw durations in explaining Arrival Delay",
     x = NULL,
-    y = "Mean Taxi-Out Time (Minutes)",
+    y = "Pearson Correlation Coefficient (r)",
     fill = NULL
   ) +
   theme_minimal(base_size = 10.5) +
   theme(
     legend.position = "bottom",
     panel.grid.minor = element_blank(),
-    strip.text = element_text(face = "bold", size = 10.5)
-  )
+    axis.text.y = element_text(face = "bold", size = 9.5)
+  ) +
+  guides(fill = guide_legend(nrow = 2))
 ```
 
 
+## Overview: Does Headquarter Matter?
+```{r}
+#| label: hq-setup
 
+active_dt[, Airport_Group := fcase(
+  Origin == "ORD", "ORD (UA HQ)",
+  Origin == "DFW", "DFW (AA HQ)",
+  Origin == "ATL", "ATL (DL HQ)",
+  Origin == "DEN", "DEN (F9 HQ)",
+  default = "Other Top-10 Airports"
+)]
+```
+
+
+```{r}
+#| label: hq-vs-nonhq-quantiles
+#| fig-height: 3.8
+#| fig-width: 7.2
+
+airport_five <- active_dt[, .(
+  Flights = format(.N, big.mark = ","),
+  Min     = as.numeric(min(TaxiOut)),
+  Q1      = as.numeric(quantile(TaxiOut, 0.25)),
+  Median  = as.numeric(quantile(TaxiOut, 0.50)),
+  Q3      = as.numeric(quantile(TaxiOut, 0.75)),
+  P95     = as.numeric(quantile(TaxiOut, 0.95)),
+  Max     = as.numeric(max(TaxiOut))
+), by = Airport_Group][order(-Median, -Q3, -P95)]
+
+kable(airport_five, caption = "Taxi-Out Five-Number Summary & Tail Extremes (Minutes): 4 HQ Airports vs. Other Airports")
+
+airport_five[, `:=`(
+  Airport_Group = factor(Airport_Group, levels = rev(Airport_Group)),
+  Group_Type    = fifelse(Airport_Group == "Other Top-10 Airports", "Non-HQ Benchmark", "Airline HQ Hub")
+)]
+
+ggplot(airport_five, aes(y = Airport_Group, fill = Group_Type, color = Group_Type)) +
+  geom_segment(aes(x = Min, xend = P95, yend = Airport_Group), linewidth = 0.95, alpha = 0.8) +
+  geom_point(aes(x = Min), shape = "|", size = 4) +
+  geom_point(aes(x = P95), shape = "|", size = 4) +
+  geom_rect(aes(xmin = Q1, xmax = Q3, ymin = as.numeric(Airport_Group) - 0.25, ymax = as.numeric(Airport_Group) + 0.25), alpha = 0.88, color = NA) +
+  geom_segment(aes(x = Median, xend = Median, y = as.numeric(Airport_Group) - 0.25, yend = as.numeric(Airport_Group) + 0.25), color = "white", linewidth = 1.2) +
+  geom_text(aes(x = P95, label = sprintf("Min:%d | Med:%d [%d-%d] | P95:%d", Min, Median, Q1, Q3, P95)),
+            hjust = -0.06, size = 2.9, fontface = "bold", show.legend = FALSE) +
+  scale_x_continuous(limits = c(0, 72), breaks = seq(0, 50, 10)) +
+  scale_fill_manual(values  = c("Airline HQ Hub" = "#e76f51", "Non-HQ Benchmark" = "#1d3557")) +
+  scale_color_manual(values = c("Airline HQ Hub" = "#e76f51", "Non-HQ Benchmark" = "#1d3557")) +
+  labs(
+    title = "Taxi-Out Full Distribution Range: Four HQ Airports vs. Other Airports",
+    subtitle = "Whisker = Min to P95; Box = IQR (Q1–Q3); White bar = Median (P50)",
+    x = "Taxi-Out Duration (Minutes)", y = NULL, fill = NULL, color = NULL
+  ) +
+  theme_minimal(base_size = 10.5) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(), axis.text.y = element_text(face = "bold", size = 10))
+```
+
+
+```{r}
+#| label: hq-vs-nonhq-airline-quantiles
+#| fig-height: 5.4
+#| fig-width: 7.6
+
+by_airline_five <- active_dt[Reporting_Airline %in% c("UA", "AA", "DL", "F9"), .(
+  Flights = format(.N, big.mark = ","),
+  Min     = as.numeric(min(TaxiOut)),
+  Q1      = as.numeric(quantile(TaxiOut, 0.25)),
+  Median  = as.numeric(quantile(TaxiOut, 0.50)),
+  Q3      = as.numeric(quantile(TaxiOut, 0.75)),
+  P95     = as.numeric(quantile(TaxiOut, 0.95)),
+  Max     = as.numeric(max(TaxiOut))
+), by = .(Airline = Reporting_Airline, Airport = Airport_Group)][order(Airline, -Median)]
+
+kable(by_airline_five, caption = "Taxi-Out Five-Number Summary & Tail Extremes (Minutes) by Airline and Airport Group")
+
+panel_order <- c("ORD (UA HQ)", "Other Top-10 Airports", "DFW (AA HQ)", "DEN (F9 HQ)", "ATL (DL HQ)")
+by_airline_five[, `:=`(
+  Airport = factor(Airport, levels = rev(panel_order)),
+  Role = fcase(
+    (Airport == "ORD (UA HQ)" & Airline == "UA") |
+    (Airport == "DFW (AA HQ)" & Airline == "AA") |
+    (Airport == "ATL (DL HQ)" & Airline == "DL") |
+    (Airport == "DEN (F9 HQ)" & Airline == "F9"),
+    "Home Carrier (HQ)",
+    Airport == "Other Top-10 Airports",
+    "Non-HQ Benchmark",
+    default = "Visiting Carrier"
+  )
+)]
+
+ggplot(by_airline_five, aes(y = Airport, fill = Role, color = Role)) +
+  geom_segment(aes(x = Min, xend = P95, yend = Airport), linewidth = 0.85, alpha = 0.75) +
+  geom_point(aes(x = Min), shape = "|", size = 3.5) +
+  geom_point(aes(x = P95), shape = "|", size = 3.5) +
+  geom_rect(aes(xmin = Q1, xmax = Q3, ymin = as.numeric(Airport) - 0.26, ymax = as.numeric(Airport) + 0.26), alpha = 0.85, color = NA) +
+  geom_segment(aes(x = Median, xend = Median, y = as.numeric(Airport) - 0.26, yend = as.numeric(Airport) + 0.26), color = "white", linewidth = 1.1) +
+  geom_text(aes(x = P95, label = sprintf("Med:%d [%d-%d] | P95:%d", Median, Q1, Q3, P95)),
+            hjust = -0.06, size = 2.55, fontface = "bold", show.legend = FALSE) +
+  scale_x_continuous(limits = c(0, 76), breaks = seq(0, 50, 10)) +
+  facet_wrap(~ Airline, ncol = 2) +
+  scale_fill_manual(values  = c("Home Carrier (HQ)" = "#e76f51", "Visiting Carrier" = "#5fa8d3", "Non-HQ Benchmark" = "#1d3557")) +
+  scale_color_manual(values = c("Home Carrier (HQ)" = "#e76f51", "Visiting Carrier" = "#5fa8d3", "Non-HQ Benchmark" = "#1d3557")) +
+  labs(
+    title = "Taxi-Out Full Distribution Range (Min, Q1, Median, Q3, P95) by Airline",
+    subtitle = "Whisker = Min to P95; Box = IQR (Q1–Q3); White bar = Median; Orange = Own HQ hub",
+    x = "Taxi-Out Duration (Minutes)", y = NULL, fill = NULL, color = NULL
+  ) +
+  theme_minimal(base_size = 10.5) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(),
+        panel.spacing = unit(1.1, "lines"), strip.text = element_text(face = "bold", size = 11))
+```
