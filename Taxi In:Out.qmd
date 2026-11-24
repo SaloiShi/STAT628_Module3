@@ -94,6 +94,8 @@ ggplot(plot_dt, aes(x = Minutes)) +
         plot.subtitle = element_text(size = 8.5, color = "gray30", lineheight = 1.2))
 ```
 
+As shown in the distribution histograms, ground taxi operations exhibit strong right skewness across both phases, with pre-departure taxi-out durations substantially longer and more variable than post-arrival taxi-in times. Specifically, departure `TaxiOut` has a median of $17\text{ min}$ and a mean of $19.3\text{ min}$, but stretches to $29\text{ min}$ at the 90th percentile and $35\text{ min}$ at the 95th percentile—indicating that roughly one in ten flights experiences severe runway queuing exceeding nearly half an hour. In contrast, arrival `TaxiIn` is concentrated within a much tighter range, with a median of $7\text{ min}$ (mean $8.2\text{ min}$), a 90th percentile of $14\text{ min}$, and a 95th percentile of $19\text{ min}$. This pronounced distributional asymmetry underscores why departure runway queuing represents a far larger source of schedule disruption than arrival gate taxiing.
+
 
 ```{r}
 #| label: delay-cor-table
@@ -192,6 +194,304 @@ ggplot(cor_plot_dt, aes(x = Predictor, y = Correlation, fill = Bar_Category)) +
   ) +
   guides(fill = guide_legend(nrow = 2))
 ```
+
+### Model Fitting
+
+```{r}
+#| label: model-fitting-and-benchmark
+#| fig-height: 4.2
+#| fig-width: 7.2
+#| warning: false
+#| message: false
+
+library(data.table)
+library(ggplot2)
+library(lightgbm)
+library(knitr)
+
+# ==============================================================================
+# 1. 数据过滤与四层时间防泄露划分 (Train / Val-Tune / Val-Calib / Test)
+# ==============================================================================
+model_dt <- dt[
+  Cancelled == 0L & Diverted == 0L &
+  !is.na(ArrDelay) & !is.na(TaxiOut) & !is.na(TaxiIn) & !is.na(DepDelay)
+]
+
+model_dt[, `:=`(
+  DepHour      = CRSDepTime %/% 100L,
+  Is_Major_Hub = as.integer(Origin %in% c("ORD", "DFW", "ATL", "DEN"))
+)]
+
+model_dt[, Dataset_Role := fcase(
+  Year %in% c(2023L, 2024L) & Month %in% 9:11,                  "Train (Sep-Nov 23/24)",
+  Year %in% c(2023L, 2024L) & Month == 12L & DayofMonth <= 20L, "Val-Tune (Dec 1-20, 23/24)",
+  Year %in% c(2023L, 2024L) & Month == 12L & DayofMonth >= 21L, "Val-Calib (Dec 21-31, 23/24)",
+  Year == 2025L             & Month %in% 9:11,                  "Test (Sep-Nov 25)",
+  default = NA_character_
+)]
+
+model_dt <- model_dt[!is.na(Dataset_Role)]
+
+# 防泄露：仅在全量 Training Set 上计算各机场滑行中位数基准
+train_origin_med <- model_dt[
+  Dataset_Role == "Train (Sep-Nov 23/24)",
+  .(Origin_Med_Out = as.numeric(median(TaxiOut))),
+  by = Origin
+]
+train_dest_med <- model_dt[
+  Dataset_Role == "Train (Sep-Nov 23/24)",
+  .(Dest_Med_In = as.numeric(median(TaxiIn))),
+  by = Dest
+]
+
+model_dt <- merge(model_dt, train_origin_med, by = "Origin", all.x = TRUE)
+model_dt <- merge(model_dt, train_dest_med,   by = "Dest",   all.x = TRUE)
+
+# 计算超额滑行时间及分段非线性特征 (Normal <= 0, Moderate 0~15m/10m, Severe > 15m/10m)
+model_dt[, `:=`(
+  ExcessTaxiOut = TaxiOut - Origin_Med_Out,
+  ExcessTaxiIn  = TaxiIn  - Dest_Med_In
+)]
+
+model_dt[, `:=`(
+  Out_Normal = pmin(ExcessTaxiOut, 0),
+  Out_Mod    = pmin(pmax(ExcessTaxiOut, 0), 15),
+  Out_Severe = pmax(ExcessTaxiOut - 15, 0),
+  In_Normal  = pmin(ExcessTaxiIn, 0),
+  In_Mod     = pmin(pmax(ExcessTaxiIn, 0), 10),
+  In_Severe  = pmax(ExcessTaxiIn - 10, 0)
+)]
+
+# ==============================================================================
+# 2. 固定随机种子抽样训练与调参 (Test 全量保留用于无偏评估)
+# ==============================================================================
+set.seed(628)
+MAX_TRAIN_N <- 300000L
+MAX_TUNE_N  <- 150000L
+
+full_train <- model_dt[Dataset_Role == "Train (Sep-Nov 23/24)"]
+full_tune  <- model_dt[Dataset_Role == "Val-Tune (Dec 1-20, 23/24)"]
+full_calib <- model_dt[Dataset_Role == "Val-Calib (Dec 21-31, 23/24)"]
+full_test  <- model_dt[Dataset_Role == "Test (Sep-Nov 25)"]
+
+train_sub <- if (nrow(full_train) > MAX_TRAIN_N) full_train[sample(.N, MAX_TRAIN_N)] else full_train
+tune_sub  <- if (nrow(full_tune)  > MAX_TUNE_N)  full_tune[sample(.N, MAX_TUNE_N)]   else full_tune
+
+# 报告表格 1：样本分配审计表 (Used vs. Available)
+sample_audit_tbl <- data.table(
+  Partition = c(
+    "Training (Sep–Nov 2023 & 2024)",
+    "Validation – Tuning (Dec 1–20, 2023 & 2024)",
+    "Validation – Calibration (Dec 21–31, 2023 & 2024)",
+    "Test (Sep–Nov 2025)"
+  ),
+  Purpose = c(
+    "Model fitting & airport baseline medians",
+    "Hyperparameter & early-stopping tuning",
+    "Conformal 90% prediction interval calibration",
+    "Unseen out-of-time evaluation (full scoring)"
+  ),
+  Available_N = format(c(nrow(full_train), nrow(full_tune), nrow(full_calib), nrow(full_test)), big.mark = ","),
+  Used_N      = format(c(nrow(train_sub),  nrow(tune_sub),  nrow(full_calib), nrow(full_test)), big.mark = ",")
+)
+kable(sample_audit_tbl, caption = "Sample Allocation Across Temporal Partitions (Used vs. Available)")
+
+# ==============================================================================
+# 3. 四类模型拟合、共形区间校准 (Dec 21-31) 与测试集评估 (Sep-Nov 2025)
+# ==============================================================================
+eval_model <- function(calib_pred, test_pred) {
+  margin90 <- as.numeric(quantile(abs(full_calib$ArrDelay - calib_pred), 0.90, na.rm = TRUE))
+  rmse     <- sqrt(mean((full_test$ArrDelay - test_pred)^2, na.rm = TRUE))
+  mae      <- mean(abs(full_test$ArrDelay - test_pred), na.rm = TRUE)
+  cov90    <- mean(abs(full_test$ArrDelay - test_pred) <= margin90, na.rm = TRUE) * 100
+  list(rmse = rmse, mae = mae, margin90 = margin90, cov90 = cov90)
+}
+
+# --- Model 1: Piecewise Linear OLS ---
+m1_piece <- lm(
+  ArrDelay ~ Out_Normal + Out_Mod + Out_Severe +
+             In_Normal + In_Mod + In_Severe + DepDelay +
+             factor(Reporting_Airline) + factor(DayOfWeek) + factor(DepHour),
+  data = train_sub
+)
+res_m1 <- eval_model(predict(m1_piece, newdata = full_calib), predict(m1_piece, newdata = full_test))
+
+# --- Model 2: Piecewise Linear OLS + Major Hub Interactions ---
+m2_hub <- lm(
+  ArrDelay ~ Out_Normal + Out_Mod + Out_Severe +
+             In_Normal + In_Mod + In_Severe + DepDelay +
+             Out_Mod:Is_Major_Hub + Out_Severe:Is_Major_Hub +
+             factor(Reporting_Airline) + factor(DayOfWeek) + factor(DepHour),
+  data = train_sub
+)
+res_m2 <- eval_model(predict(m2_hub, newdata = full_calib), predict(m2_hub, newdata = full_test))
+
+# --- Model 3: Pure Gradient Boosted Trees (LightGBM) ---
+lgb_features <- c(
+  "ExcessTaxiOut", "ExcessTaxiIn", "TaxiOut", "TaxiIn",
+  "DepDelay", "CRSElapsedTime", "DepHour", "DayOfWeek", "Month",
+  "Reporting_Airline", "Origin", "Dest"
+)
+
+all_cats <- list(
+  Reporting_Airline = sort(unique(model_dt$Reporting_Airline)),
+  Origin            = sort(unique(model_dt$Origin)),
+  Dest              = sort(unique(model_dt$Dest))
+)
+
+encode_matrix <- function(dt_in) {
+  x <- copy(dt_in[, ..lgb_features])
+  for (col in names(all_cats)) {
+    x[, (col) := as.integer(factor(get(col), levels = all_cats[[col]]))]
+  }
+  as.matrix(x)
+}
+
+dtrain <- lgb.Dataset(data = encode_matrix(train_sub), label = train_sub$ArrDelay)
+dtune  <- lgb.Dataset(data = encode_matrix(tune_sub),  label = tune_sub$ArrDelay, reference = dtrain)
+
+set.seed(628)
+m3_lgb <- lgb.train(
+  params = list(
+    objective = "regression", metric = "rmse",
+    learning_rate = 0.05, num_leaves = 63, min_data_in_leaf = 100,
+    feature_fraction = 0.8, bagging_fraction = 0.8, bagging_freq = 1, num_threads = 4
+  ),
+  data = dtrain, nrounds = 1000,
+  valids = list(val_tune = dtune), early_stopping_rounds = 30, verbose = -1
+)
+res_m3 <- eval_model(predict(m3_lgb, encode_matrix(full_calib)), predict(m3_lgb, encode_matrix(full_test)))
+
+# --- Model 4: Hybrid (Piecewise OLS + LightGBM Residuals) ---
+train_res <- train_sub$ArrDelay - predict(m1_piece, newdata = train_sub)
+tune_res  <- tune_sub$ArrDelay  - predict(m1_piece, newdata = tune_sub)
+
+dtrain_res <- lgb.Dataset(data = encode_matrix(train_sub), label = train_res)
+dtune_res  <- lgb.Dataset(data = encode_matrix(tune_sub),  label = tune_res, reference = dtrain_res)
+
+set.seed(628)
+m4_hyb_lgb <- lgb.train(
+  params = list(
+    objective = "regression", metric = "rmse",
+    learning_rate = 0.03, num_leaves = 31, min_data_in_leaf = 150,
+    feature_fraction = 0.8, bagging_fraction = 0.8, bagging_freq = 1, num_threads = 4
+  ),
+  data = dtrain_res, nrounds = 800,
+  valids = list(val_tune = dtune_res), early_stopping_rounds = 30, verbose = -1
+)
+
+calib_hyb_pred <- predict(m1_piece, newdata = full_calib) + predict(m4_hyb_lgb, encode_matrix(full_calib))
+test_hyb_pred  <- predict(m1_piece, newdata = full_test)  + predict(m4_hyb_lgb, encode_matrix(full_test))
+res_m4 <- eval_model(calib_hyb_pred, test_hyb_pred)
+
+# 报告表格 2：四模型无偏测试集全景对比表
+benchmark_tbl <- data.table(
+  Model = c(
+    "1. Piecewise Linear (OLS)",
+    "2. Piecewise Linear (+ Hub Interactions)",
+    "3. Gradient Boosted Trees (LightGBM)",
+    "4. Hybrid (Piecewise OLS + LightGBM Residuals)"
+  ),
+  Test_RMSE_Min    = round(c(res_m1$rmse, res_m2$rmse, res_m3$rmse, res_m4$rmse), 2),
+  Test_MAE_Min     = round(c(res_m1$mae,  res_m2$mae,  res_m3$mae,  res_m4$mae),  2),
+  Calib_90PI_Width = sprintf("±%.1f min", c(res_m1$margin90, res_m2$margin90, res_m3$margin90, res_m4$margin90)),
+  Test_Coverage_90 = sprintf("%.1f%%", c(res_m1$cov90, res_m2$cov90, res_m3$cov90, res_m4$cov90))
+)
+kable(benchmark_tbl, caption = "Comprehensive Model Benchmark on Unseen Test Set (Sep–Nov 2025)")
+```
+
+
+```{r}
+# ==============================================================================
+# 4. 边际效应可视化（优化版：左右分面 + 1:1 物理传导参考线 + 实际拥堵分布区间）
+# ==============================================================================
+base_grid <- data.table(
+  DepDelay = 0, Reporting_Airline = "UA", DayOfWeek = 3L, DepHour = 12L
+)
+
+# 计算实际数据中 P05 - P95 的分布区间，用来标出真实高发区域
+p95_out <- as.numeric(quantile(full_train$ExcessTaxiOut, 0.95, na.rm = TRUE))
+p95_in  <- as.numeric(quantile(full_train$ExcessTaxiIn,  0.95, na.rm = TRUE))
+
+grid_out <- cbind(base_grid, data.table(ExcessTaxiOut = seq(-10, 40, by = 1), ExcessTaxiIn = 0))
+grid_out[, `:=`(
+  Out_Normal = pmin(ExcessTaxiOut, 0),
+  Out_Mod    = pmin(pmax(ExcessTaxiOut, 0), 15),
+  Out_Severe = pmax(ExcessTaxiOut - 15, 0),
+  In_Normal  = 0, In_Mod = 0, In_Severe = 0
+)]
+grid_out[, `:=`(
+  Pred_Delay = predict(m1_piece, newdata = grid_out),
+  Phase      = "1. Departure Taxi-Out (Runway Queue)",
+  Excess_Min = ExcessTaxiOut,
+  P95_Limit  = p95_out
+)]
+
+grid_in <- cbind(base_grid, data.table(ExcessTaxiOut = 0, ExcessTaxiIn = seq(-10, 40, by = 1)))
+grid_in[, `:=`(
+  Out_Normal = 0, Out_Mod = 0, Out_Severe = 0,
+  In_Normal  = pmin(ExcessTaxiIn, 0),
+  In_Mod     = pmin(pmax(ExcessTaxiIn, 0), 10),
+  In_Severe  = pmax(ExcessTaxiIn - 10, 0)
+)]
+grid_in[, `:=`(
+  Pred_Delay = predict(m1_piece, newdata = grid_in),
+  Phase      = "2. Arrival Taxi-In (Gate Wait)",
+  Excess_Min = ExcessTaxiIn,
+  P95_Limit  = p95_in
+)]
+
+effect_dt <- rbind(
+  grid_out[, .(Phase, Excess_Min, Pred_Delay, P95_Limit)],
+  grid_in[,  .(Phase, Excess_Min, Pred_Delay, P95_Limit)]
+)
+
+# 提取斜率标签标注在图上
+b_out_mod <- round(coef(m1_piece)["Out_Mod"], 2)
+b_out_sev <- round(coef(m1_piece)["Out_Severe"], 2)
+b_in_mod  <- round(coef(m1_piece)["In_Mod"], 2)
+b_in_sev  <- round(coef(m1_piece)["In_Severe"], 2)
+
+annot_dt <- data.table(
+  Phase = c("1. Departure Taxi-Out (Runway Queue)", "2. Arrival Taxi-In (Gate Wait)"),
+  x     = c(12, 12),
+  y     = c(-12, -12),
+  label = c(
+    sprintf("Slope (0–15m): +%.2f min/min\nSlope (>15m): +%.2f min/min\n95th Pct Excess: +%.0f min", b_out_mod, b_out_sev, p95_out),
+    sprintf("Slope (0–10m): +%.2f min/min\nSlope (>10m): +%.2f min/min\n95th Pct Excess: +%.0f min", b_in_mod, b_in_sev, p95_in)
+  )
+)
+
+ggplot(effect_dt, aes(x = Excess_Min, y = Pred_Delay, color = Phase)) +
+  # 标出 0 到 P95 的常规高频发生区
+  geom_rect(aes(xmin = 0, xmax = P95_Limit, ymin = -Inf, ymax = Inf),
+            fill = "gray92", color = NA, alpha = 0.5, inherit.aes = FALSE,
+            data = unique(effect_dt[, .(Phase, P95_Limit)])) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray55") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray55") +
+  geom_line(linewidth = 1.3) +
+  geom_text(data = annot_dt, aes(x = x, y = y, label = label),
+            color = "gray20", size = 3.2, hjust = 0, lineheight = 1.15, inherit.aes = FALSE) +
+  facet_wrap(~ Phase, ncol = 2) +
+  scale_color_manual(values = c(
+    "1. Departure Taxi-Out (Runway Queue)" = "#e76f51",
+    "2. Arrival Taxi-In (Gate Wait)"       = "#2b5c8f"
+  )) +
+  labs(
+    title    = "Marginal Pass-Through of Excess Taxi Time into Arrival Delay",
+    subtitle = "Shaded region marks 0 to 95th percentile excess congestion; holding DepDelay = 0 (Piecewise OLS)",
+    x        = "Excess Taxi Duration Above Airport Median (Minutes)",
+    y        = "Predicted Arrival Delay (Minutes)"
+  ) +
+  theme_minimal(base_size = 10.5) +
+  theme(
+    legend.position  = "none",
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold", size = 10.5),
+    panel.spacing    = unit(1.2, "lines")
+  )
+```
+
 
 
 ## Overview: Does Headquarter Matter?
@@ -304,3 +604,8 @@ ggplot(by_airline_five, aes(y = Airport, fill = Role, color = Role)) +
   theme(legend.position = "bottom", panel.grid.minor = element_blank(),
         panel.spacing = unit(1.1, "lines"), strip.text = element_text(face = "bold", size = 11))
 ```
+
+### Specific Topic on Certain Airports
+
+
+
