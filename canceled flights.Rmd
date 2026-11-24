@@ -1,0 +1,469 @@
+---
+title: "canceled flights"
+output: pdf_document
+date: ""
+header-includes:
+  - \usepackage{float}
+---
+
+```{r report-output, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r cancellation-data, message=FALSE}
+library(data.table)
+library(ggplot2)
+rate_pct <- function(x) scales::percent(x, accuracy = 0.001)
+cancel_columns <- c(
+  "FlightDate", "Year", "Month", "DayOfWeek", "Reporting_Airline",
+  "Origin", "Dest", "CRSDepTime", "CRSArrTime",
+  "Cancelled", "use_cancel", "split"
+)
+
+flights <- fread(
+  "flights_cleaned.csv",
+  select = cancel_columns,
+  colClasses = list(character = c("CRSDepTime", "CRSArrTime")),
+  showProgress = FALSE
+)
+
+flights <- flights[use_cancel == TRUE]
+split_order <- c("train", "validation", "test")
+
+stopifnot(
+  all(flights$Cancelled %in% c(0L, 1L)),
+  setequal(flights$split, split_order)
+)
+
+train <- flights[split == "train"]
+validation <- flights[split == "validation"]
+test <- flights[split == "test"]
+```
+
+
+## Study population
+
+This analysis covers scheduled flights reported by American, Delta, Frontier, and United from the ten busiest origin cities within the study sample. Following the project scope, we exclude diverted flights and retain records with a known cancellation status. In each group, the observed cancellation rate is the number of canceled flights divided by the number of eligible flights.
+
+```{r cancellation-split}
+split_summary <- flights[, .(
+  flights = .N,
+  cancelled = sum(Cancelled == 1L)
+), by = split]
+
+split_summary <- split_summary[match(split_order, split)]
+split_summary[, rate := cancelled / flights]
+
+knitr::kable(
+  split_summary[, .(
+    split, flights, cancelled,
+    rate = scales::percent(rate, accuracy = 0.001)
+  )],
+  col.names = c("Split", "Flights", "Cancelled", "Cancellation rate"),
+  format.args = list(big.mark = ",")
+)
+```
+
+The training set had about `r round(1000 * split_summary[split == "train", rate], 1)` cancellations per 1,000 flights. Its observed rate of `r split_summary[split == "train", rate_pct(rate)]` serves as the reference probability for evaluating a model. The figures below use the training set. The historical December flights are reserved for model selection, and the 2025 flights are held out for final evaluation.
+
+
+## Cancellation rates by month
+
+```{r cancellation-by-month, fig.width=7, fig.height=3.3}
+monthly <- train[, .(
+  flights = .N,
+  cancelled = sum(Cancelled == 1L)
+), by = .(Year, Month)]
+
+monthly[, rate := cancelled / flights]
+
+ggplot(monthly, aes(
+  x = factor(Month, labels = c("Sep", "Oct", "Nov")),
+  y = rate,
+  color = factor(Year),
+  group = Year
+)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  scale_y_continuous(
+    limits = c(0, NA),
+    labels = scales::label_percent(accuracy = 0.1)
+  ) +
+  labs(x = "Flight month", y = "Cancellation rate", color = "Year") +
+  theme_minimal()
+```
+
+In 2023, the cancellation rate fell from `r monthly[Year == 2023L & Month == 9L, rate_pct(rate)]` in September to `r monthly[Year == 2023L & Month == 11L, rate_pct(rate)]` in November. In 2024, the rate peaked in October at `r monthly[Year == 2024L & Month == 10L, rate_pct(rate)]`. The monthly pattern shifted across years, so the two December validation periods should be examined individually as well as together.
+
+## Cancellation rates by airline and departure time
+
+Departure time refers to the scheduled local time at the origin airport. The four panels share the same vertical scale so the rates can be compared across airlines and time periods.
+
+```{r cancellation-by-time, fig.width=7, fig.height=5}
+scheduled_period <- function(hhmm) {
+  stopifnot(!anyNA(hhmm), all(grepl("^[0-9]{1,4}$", hhmm)))
+  clock <- as.integer(hhmm)
+  stopifnot(all(clock == 2400L | (clock < 2400L & clock %% 100L < 60L)))
+
+  cut(
+    (clock %/% 100L) %% 24L,
+    breaks = c(0, 6, 12, 18, 24),
+    labels = c("00-05", "06-11", "12-17", "18-23"),
+    right = FALSE
+  )
+}
+
+train[, dep_period := scheduled_period(CRSDepTime)]
+
+by_period <- train[, .(
+  flights = .N,
+  cancelled = sum(Cancelled == 1L)
+), by = .(Reporting_Airline, dep_period)]
+
+by_period[, rate := cancelled / flights]
+setorder(by_period, Reporting_Airline, dep_period)
+
+ggplot(by_period, aes(x = dep_period, y = rate)) +
+  geom_col(fill = "#28788B", width = 0.68) +
+  facet_wrap(~ Reporting_Airline, ncol = 2) +
+  scale_y_continuous(
+    breaks = seq(0, 0.015, by = 0.005),
+    labels = scales::label_percent(accuracy = 0.1),
+    expand = expansion(mult = c(0, 0.10))
+  ) +
+  labs(x = "Scheduled departure hour (local time)", y = "Cancellation rate") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank())
+```
+
+For American, the cancellation rate was `r by_period[Reporting_Airline == "AA" & dep_period == "06-11", rate_pct(rate)]` for 06:00-11:59 departures and `r by_period[Reporting_Airline == "AA" & dep_period == "18-23", rate_pct(rate)]` for 18:00-23:59 departures. For United, the rate was `r by_period[Reporting_Airline == "UA" & dep_period == "06-11", rate_pct(rate)]` in the morning and `r by_period[Reporting_Airline == "UA" & dep_period == "18-23", rate_pct(rate)]` in the evening. The direction of the difference varied by airline. These comparisons pool airports and routes, which can have different schedules and cancellation risks.
+
+```{r cancellation-time-counts}
+period_counts <- copy(by_period)
+period_counts[, counts := paste(
+  formatC(cancelled, format = "d", big.mark = ","),
+  formatC(flights, format = "d", big.mark = ","),
+  sep = " / "
+)]
+
+knitr::kable(
+  dcast(period_counts, Reporting_Airline ~ dep_period, value.var = "counts"),
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  col.names = c("Airline", "00-05", "06-11", "12-17", "18-23"),
+  caption = "Canceled flights / total flights by airline and scheduled departure hour."
+)
+```
+
+A flight-level model should use information available before departure, including the airline, both airports, and scheduled departure and arrival times. Accounting for the itinerary allows us to check whether the time-of-day patterns persist. After comparison with the constant baseline on the December validation sets, final evaluation uses the 2025 holdout. The flight-level output will give a cancellation probability and an uncertainty interval.
+
+## Preparing predictors for modeling
+
+```{r cancellation-predictors, echo=FALSE}
+dest_counts <- train[, .N, by = Dest]
+common_dest <- sort(dest_counts[N >= 500L, Dest])
+dest_levels <- c(common_dest, "Other")
+carrier_levels <- sort(unique(train$Reporting_Airline))
+origin_levels <- sort(unique(train$Origin))
+
+make_cancel_predictors <- function(data) {
+  stopifnot(!anyNA(data$Dest), all(nzchar(data$Dest)))
+
+  predictors <- data[, .(
+    Reporting_Airline = factor(Reporting_Airline, levels = carrier_levels),
+    Origin = factor(Origin, levels = origin_levels),
+    dest_group = factor(
+      fifelse(Dest %chin% common_dest, Dest, "Other"),
+      levels = dest_levels
+    ),
+    dep_period = scheduled_period(CRSDepTime),
+    arr_period = scheduled_period(CRSArrTime),
+    weekday = factor(DayOfWeek, levels = 1:7)
+  )]
+
+  stopifnot(nrow(predictors) == nrow(data), !anyNA(predictors))
+  predictors
+}
+
+train_x <- make_cancel_predictors(train)
+validation_x <- make_cancel_predictors(validation)
+
+knitr::kable(
+  data.table(
+    Split = c("Training", "December validation"),
+    Flights = c(nrow(train_x), nrow(validation_x)),
+    Other = c(
+      sum(train_x$dest_group == "Other"),
+      sum(validation_x$dest_group == "Other")
+    )
+  ),
+  col.names = c("Split", "Flights", "Flights with an Other destination"),
+  format.args = list(big.mark = ",")
+)
+```
+
+The six predictors describe the airline, the origin and destination airports, the scheduled local departure and arrival periods, and the day of the week. We kept destinations with at least 500 training flights as separate categories. All remaining destinations, including airports first seen in validation, used the Other category. This group contained `r format(sum(train_x$dest_group == "Other"), big.mark = ",")` training flights and `r format(sum(validation_x$dest_group == "Other"), big.mark = ",")` validation flights. These flights were retained and share one destination category.
+
+## Model specification
+
+Let $Y_i=1$ if scheduled flight $i$ was canceled and $Y_i=0$ otherwise. Let $p_i$ be the cancellation probability for that flight. All three models specify the log-odds $\eta_i$ and convert it to a probability using the logistic link.
+
+$$
+\eta_i = \log\!\left(\frac{p_i}{1-p_i}\right),
+\qquad
+p_i = \frac{1}{1+\exp(-\eta_i)}.
+$$
+
+For flight $i$, let $a_i$ be the reporting airline, $o_i$ the departure airport, $d_i$ the destination group, $s_i$ the scheduled departure period, $r_i$ the scheduled arrival period, and $w_i$ the day of the week. Departure and arrival periods use the local clock at their respective airports.
+
+$$
+\begin{aligned}
+\mathrm{M0}\qquad \eta_i
+  &= \beta_0,\\[3pt]
+\mathrm{M1}\qquad \eta_i
+  &= \beta_0 + \alpha_{a_i} + \gamma_{o_i} + \delta_{d_i}
+    + \theta_{s_i} + \phi_{r_i} + \omega_{w_i},\\[3pt]
+\mathrm{M2}\qquad \eta_i
+  &= \beta_0 + \alpha_{a_i} + \gamma_{o_i} + \delta_{d_i}
+    + \theta_{s_i} + \phi_{r_i} + \omega_{w_i}
+    + \kappa_{a_i,s_i}.
+\end{aligned}
+$$
+
+**M0** assigns every flight the training-set cancellation rate of `r rate_pct(mean(train$Cancelled))`. **M1** adds one coefficient for each applicable itinerary category, using reference-category coding. **M2** adds the airline-by-departure-period term $\kappa_{a_i,s_i}$, so the association between departure period and cancellation can vary across airlines on the log-odds scale.
+
+Each model has its own fitted coefficients. For M1 and M2, ridge fitting adds the penalty $(\lambda/2)\sum_{j=1}^{q}\beta_j^2$ to the training negative log-likelihood, where the $\beta_j$ are the $q$ non-intercept coefficients.
+
+## Constant-risk baseline
+
+```{r cancellation-baseline, echo=FALSE}
+score_cancel_predictions <- function(data, probability, model_name) {
+  stopifnot(
+    length(probability) == nrow(data),
+    all(is.finite(probability) & probability >= 0 & probability <= 1),
+    all(data$Cancelled %in% c(0L, 1L))
+  )
+
+  p <- pmin(pmax(probability, 1e-15), 1 - 1e-15)
+  scored <- data.table(
+    period = as.character(data$Year),
+    cancelled = data$Cancelled,
+    prediction = probability,
+    loss = -ifelse(data$Cancelled == 1L, log(p), log1p(-p))
+  )
+
+  rbind(scored, copy(scored)[, period := "Pooled"])[, .(
+    model = model_name,
+    flights = .N,
+    cancellations = sum(cancelled),
+    observed_rate = mean(cancelled),
+    mean_prediction = mean(prediction),
+    log_loss = mean(loss)
+  ), by = period][order(period)]
+}
+
+m0_prob <- mean(train$Cancelled)
+m0_validation <- score_cancel_predictions(
+  validation,
+  rep(m0_prob, nrow(validation)),
+  "M0"
+)
+
+knitr::kable(
+  m0_validation[, .(
+    period, flights, cancellations,
+    observed = rate_pct(observed_rate),
+    predicted = rate_pct(mean_prediction),
+    log_loss = sprintf("%.6f", log_loss)
+  )],
+  col.names = c("Period", "Flights", "Canceled", "Observed rate",
+                "Mean prediction", "Log loss"),
+  format.args = list(big.mark = ",")
+)
+```
+M0 assigned a cancellation probability of `r rate_pct(m0_prob)` to every validation flight. It overestimated the observed rate of `r m0_validation[period == "2023", rate_pct(observed_rate)]` in December 2023 and underestimated the observed rate of `r m0_validation[period == "2024", rate_pct(observed_rate)]` in December 2024. The pooled log loss was `r sprintf("%.6f", m0_validation[period == "Pooled", log_loss])`. This is the benchmark for comparing models on the same December flights. Reporting each year separately shows whether a model systematically overpredicts or underpredicts cancellations in a particular December.
+
+
+## Main-effects ridge logistic regression (M1)
+
+M1 used main effects for the six itinerary predictors. Coefficients were fitted on the training flights using ridge logistic regression, with an unpenalized intercept. The ridge penalty was selected from the shared candidate grid using pooled December validation log loss.
+
+```{r cancellation-m1-fit, echo=FALSE}
+m1_formula <- ~ Reporting_Airline + Origin + dest_group +
+  dep_period + arr_period + weekday
+
+m1_training <- copy(train_x)
+m1_training[, cancelled := train$Cancelled]
+
+m1_cells <- m1_training[, .(
+  flights = .N,
+  cancelled = sum(cancelled)
+), by = names(train_x)]
+
+stopifnot(
+  sum(m1_cells$flights) == nrow(train),
+  sum(m1_cells$cancelled) == sum(train$Cancelled)
+)
+
+m1_train_matrix <- Matrix::sparse.model.matrix(m1_formula, data = m1_cells)
+m1_validation_matrix <- Matrix::sparse.model.matrix(
+  m1_formula,
+  data = validation_x
+)
+stopifnot(identical(
+  colnames(m1_train_matrix),
+  colnames(m1_validation_matrix)
+))
+
+fit_ridge_logistic <- function(x, flights, cancelled, lambda) {
+  initial <- c(qlogis(sum(cancelled) / sum(flights)), rep(0, ncol(x) - 1L))
+
+  objective <- function(beta) {
+    eta <- as.numeric(x %*% beta)
+    log_normalizer <- pmax(eta, 0) + log1p(exp(-abs(eta)))
+    sum(flights * log_normalizer - cancelled * eta) +
+      lambda * sum(beta[-1L]^2) / 2
+  }
+
+  gradient <- function(beta) {
+    eta <- as.numeric(x %*% beta)
+    residual <- flights * plogis(eta) - cancelled
+    as.numeric(Matrix::crossprod(x, residual)) + lambda * c(0, beta[-1L])
+  }
+
+  fitted <- optim(
+    initial, objective, gradient, method = "BFGS",
+    control = list(maxit = 1000L, reltol = 1e-12)
+  )
+  stopifnot(fitted$convergence == 0L, all(is.finite(fitted$par)))
+  fitted
+}
+
+m1_lambdas <- c(1, 10, 30, 100, 200, 300, 500, 750, 1000, 2000, 3000)
+m1_fits <- lapply(m1_lambdas, function(lambda) {
+  fit_ridge_logistic(
+    m1_train_matrix, m1_cells$flights, m1_cells$cancelled, lambda
+  )
+})
+
+m1_probabilities <- lapply(m1_fits, function(fitted) {
+  plogis(as.numeric(m1_validation_matrix %*% fitted$par))
+})
+
+m1_tuning <- data.table(
+  lambda = m1_lambdas,
+  log_loss = vapply(m1_probabilities, function(probability) {
+    score_cancel_predictions(validation, probability, "M1")[
+      period == "Pooled", log_loss
+    ]
+  }, numeric(1))
+)
+
+best_m1 <- which.min(m1_tuning$log_loss)
+m1_lambda <- m1_tuning$lambda[best_m1]
+m1_fit <- m1_fits[[best_m1]]
+m1_prob <- m1_probabilities[[best_m1]]
+
+knitr::kable(
+  m1_tuning[, .(lambda, log_loss = sprintf("%.6f", log_loss))],
+  col.names = c("Ridge penalty", "Pooled December log loss"),
+  position = "H",
+  caption = "Selection of the ridge penalty for M1."
+)
+```
+
+## December validation of M0 and M1
+
+```{r cancellation-m1-validation, echo=FALSE}
+m1_validation <- score_cancel_predictions(validation, m1_prob, "M1")
+
+validation_compare <- rbindlist(
+  list(m0_validation, m1_validation),
+  use.names = TRUE
+)
+setorder(validation_compare, period, model)
+
+knitr::kable(
+  validation_compare[, .(
+    period, model,
+    observed = rate_pct(observed_rate),
+    predicted = rate_pct(mean_prediction),
+    log_loss = sprintf("%.6f", log_loss)
+  )],
+  col.names = c("Period", "Model", "Observed rate", "Mean prediction", "Log loss"),
+  position = "H",
+  caption = "Cancellation probability performance on the December validation flights."
+)
+```
+
+Among the candidate penalties, `r m1_lambda` gave the lowest pooled December log loss. With this penalty, M1 reduced pooled log loss from `r sprintf("%.6f", m0_validation[period == "Pooled", log_loss])` for M0 to `r sprintf("%.6f", m1_validation[period == "Pooled", log_loss])`. The reduction came from December 2024, where M1 scored better. Log loss was slightly higher for M1 in December 2023. M1 still overestimated the overall cancellation rate in December 2023 and underestimated it in December 2024. These are validation results used in model selection. Final evaluation uses the 2025 holdout.
+
+## Airline and departure-period interaction (M2)
+
+M2 added an interaction between the reporting airline and the scheduled departure period, allowing the departure-period coefficients to vary by airline. We used the same training flights, candidate ridge penalties, and December validation flights as for M1.
+
+```{r cancellation-m2, echo=FALSE}
+m2_formula <- update(m1_formula, ~ . + Reporting_Airline:dep_period)
+
+m2_train_matrix <- Matrix::sparse.model.matrix(m2_formula, data = m1_cells)
+m2_validation_matrix <- Matrix::sparse.model.matrix(
+  m2_formula,
+  data = validation_x
+)
+stopifnot(identical(
+  colnames(m2_train_matrix),
+  colnames(m2_validation_matrix)
+))
+
+m2_fits <- lapply(m1_lambdas, function(lambda) {
+  fit_ridge_logistic(
+    m2_train_matrix, m1_cells$flights, m1_cells$cancelled, lambda
+  )
+})
+
+m2_probabilities <- lapply(m2_fits, function(fitted) {
+  plogis(as.numeric(m2_validation_matrix %*% fitted$par))
+})
+
+m2_tuning <- data.table(
+  lambda = m1_lambdas,
+  log_loss = vapply(m2_probabilities, function(probability) {
+    score_cancel_predictions(validation, probability, "M2")[
+      period == "Pooled", log_loss
+    ]
+  }, numeric(1))
+)
+
+best_m2 <- which.min(m2_tuning$log_loss)
+m2_lambda <- m2_tuning$lambda[best_m2]
+m2_fit <- m2_fits[[best_m2]]
+m2_prob <- m2_probabilities[[best_m2]]
+
+m2_validation <- score_cancel_predictions(validation, m2_prob, "M2")
+
+m1_m2_compare <- merge(
+  m1_validation[, .(period, m1_loss = log_loss)],
+  m2_validation[, .(period, m2_loss = log_loss)],
+  by = "period"
+)
+m1_m2_compare[, change := m2_loss - m1_loss]
+
+knitr::kable(
+  m1_m2_compare[, .(
+    period,
+    m1_loss = sprintf("%.6f", m1_loss),
+    m2_loss = sprintf("%.6f", m2_loss),
+    change = sprintf("%+.6f", change)
+  )],
+  col.names = c("Period", "M1 log loss", "M2 log loss", "Change (M2 - M1)"),
+  position = "H",
+  caption = "Effect of adding the airline-by-departure-period interaction."
+)
+```
+
+Both models selected a ridge penalty of `r m1_lambda`. M2 slightly reduced log loss in December 2023 and slightly increased it in December 2024. The pooled log loss was `r sprintf("%.6f", m1_m2_compare[period == "Pooled", m1_loss])` for M1 and `r sprintf("%.6f", m1_m2_compare[period == "Pooled", m2_loss])` for M2. We selected M1 for final evaluation on the 2025 holdout because it had slightly lower pooled log loss and fewer coefficients.
