@@ -12,7 +12,7 @@ count_fmt <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TR
 ## Study scope
 
 The dataset covers September through December in 2023 and 2024 and September
-through November in 2025. We kept flights reported by WN, AA, DL, and UA,
+through November in 2025. We kept flights reported by F9, AA, DL, and UA,
 excluded flights marked as diverted, and ranked origin cities by the remaining
 record count across all four airlines and 11 months. We kept every destination
 served by flights departing from the ten highest-ranked cities. The filtered
