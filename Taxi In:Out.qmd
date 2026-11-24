@@ -209,9 +209,6 @@ library(ggplot2)
 library(lightgbm)
 library(knitr)
 
-# ==============================================================================
-# 1. 数据过滤与四层时间防泄露划分 (Train / Val-Tune / Val-Calib / Test)
-# ==============================================================================
 model_dt <- dt[
   Cancelled == 0L & Diverted == 0L &
   !is.na(ArrDelay) & !is.na(TaxiOut) & !is.na(TaxiIn) & !is.na(DepDelay)
@@ -232,7 +229,6 @@ model_dt[, Dataset_Role := fcase(
 
 model_dt <- model_dt[!is.na(Dataset_Role)]
 
-# 防泄露：仅在全量 Training Set 上计算各机场滑行中位数基准
 train_origin_med <- model_dt[
   Dataset_Role == "Train (Sep-Nov 23/24)",
   .(Origin_Med_Out = as.numeric(median(TaxiOut))),
@@ -247,7 +243,6 @@ train_dest_med <- model_dt[
 model_dt <- merge(model_dt, train_origin_med, by = "Origin", all.x = TRUE)
 model_dt <- merge(model_dt, train_dest_med,   by = "Dest",   all.x = TRUE)
 
-# 计算超额滑行时间及分段非线性特征 (Normal <= 0, Moderate 0~15m/10m, Severe > 15m/10m)
 model_dt[, `:=`(
   ExcessTaxiOut = TaxiOut - Origin_Med_Out,
   ExcessTaxiIn  = TaxiIn  - Dest_Med_In
@@ -261,10 +256,10 @@ model_dt[, `:=`(
   In_Mod     = pmin(pmax(ExcessTaxiIn, 0), 10),
   In_Severe  = pmax(ExcessTaxiIn - 10, 0)
 )]
+```
 
-# ==============================================================================
-# 2. 固定随机种子抽样训练与调参 (Test 全量保留用于无偏评估)
-# ==============================================================================
+
+```{r}
 set.seed(628)
 MAX_TRAIN_N <- 300000L
 MAX_TUNE_N  <- 150000L
@@ -276,8 +271,10 @@ full_test  <- model_dt[Dataset_Role == "Test (Sep-Nov 25)"]
 
 train_sub <- if (nrow(full_train) > MAX_TRAIN_N) full_train[sample(.N, MAX_TRAIN_N)] else full_train
 tune_sub  <- if (nrow(full_tune)  > MAX_TUNE_N)  full_tune[sample(.N, MAX_TUNE_N)]   else full_tune
+```
 
-# 报告表格 1：样本分配审计表 (Used vs. Available)
+
+```{r}
 sample_audit_tbl <- data.table(
   Partition = c(
     "Training (Sep–Nov 2023 & 2024)",
@@ -295,10 +292,10 @@ sample_audit_tbl <- data.table(
   Used_N      = format(c(nrow(train_sub),  nrow(tune_sub),  nrow(full_calib), nrow(full_test)), big.mark = ",")
 )
 kable(sample_audit_tbl, caption = "Sample Allocation Across Temporal Partitions (Used vs. Available)")
+```
 
-# ==============================================================================
-# 3. 四类模型拟合、共形区间校准 (Dec 21-31) 与测试集评估 (Sep-Nov 2025)
-# ==============================================================================
+
+```{r}
 eval_model <- function(calib_pred, test_pred) {
   margin90 <- as.numeric(quantile(abs(full_calib$ArrDelay - calib_pred), 0.90, na.rm = TRUE))
   rmse     <- sqrt(mean((full_test$ArrDelay - test_pred)^2, na.rm = TRUE))
@@ -306,7 +303,10 @@ eval_model <- function(calib_pred, test_pred) {
   cov90    <- mean(abs(full_test$ArrDelay - test_pred) <= margin90, na.rm = TRUE) * 100
   list(rmse = rmse, mae = mae, margin90 = margin90, cov90 = cov90)
 }
+```
 
+
+```{r}
 # --- Model 1: Piecewise Linear OLS ---
 m1_piece <- lm(
   ArrDelay ~ Out_Normal + Out_Mod + Out_Severe +
@@ -383,8 +383,10 @@ m4_hyb_lgb <- lgb.train(
 calib_hyb_pred <- predict(m1_piece, newdata = full_calib) + predict(m4_hyb_lgb, encode_matrix(full_calib))
 test_hyb_pred  <- predict(m1_piece, newdata = full_test)  + predict(m4_hyb_lgb, encode_matrix(full_test))
 res_m4 <- eval_model(calib_hyb_pred, test_hyb_pred)
+```
 
-# 报告表格 2：四模型无偏测试集全景对比表
+
+```{r}
 benchmark_tbl <- data.table(
   Model = c(
     "1. Piecewise Linear (OLS)",
@@ -402,14 +404,10 @@ kable(benchmark_tbl, caption = "Comprehensive Model Benchmark on Unseen Test Set
 
 
 ```{r}
-# ==============================================================================
-# 4. 边际效应可视化（优化版：左右分面 + 1:1 物理传导参考线 + 实际拥堵分布区间）
-# ==============================================================================
 base_grid <- data.table(
   DepDelay = 0, Reporting_Airline = "UA", DayOfWeek = 3L, DepHour = 12L
 )
 
-# 计算实际数据中 P05 - P95 的分布区间，用来标出真实高发区域
 p95_out <- as.numeric(quantile(full_train$ExcessTaxiOut, 0.95, na.rm = TRUE))
 p95_in  <- as.numeric(quantile(full_train$ExcessTaxiIn,  0.95, na.rm = TRUE))
 
@@ -446,7 +444,6 @@ effect_dt <- rbind(
   grid_in[,  .(Phase, Excess_Min, Pred_Delay, P95_Limit)]
 )
 
-# 提取斜率标签标注在图上
 b_out_mod <- round(coef(m1_piece)["Out_Mod"], 2)
 b_out_sev <- round(coef(m1_piece)["Out_Severe"], 2)
 b_in_mod  <- round(coef(m1_piece)["In_Mod"], 2)
@@ -463,7 +460,6 @@ annot_dt <- data.table(
 )
 
 ggplot(effect_dt, aes(x = Excess_Min, y = Pred_Delay, color = Phase)) +
-  # 标出 0 到 P95 的常规高频发生区
   geom_rect(aes(xmin = 0, xmax = P95_Limit, ymin = -Inf, ymax = Inf),
             fill = "gray92", color = NA, alpha = 0.5, inherit.aes = FALSE,
             data = unique(effect_dt[, .(Phase, P95_Limit)])) +
