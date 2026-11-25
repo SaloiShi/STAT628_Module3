@@ -65,3 +65,12 @@ Check for duplicate records and validate airport codes, airline codes, and sched
 - ActualElapsedTime CRSElapsedTime
 - DistanceGroup
 - CarrierDelay WeatherDelay NASDelay SecurityDelay LateAircraftDelay TotalAddGTime
+
+### Additional calendar features
+
+The cleaned dataset also includes two binary travel-period indicators:
+
+- **is_thanksgiving_period:** 1 from three days before through three days after Thanksgiving, inclusive (Monday–Sunday); 0 otherwise. Thanksgiving is the fourth Thursday of November and is calculated separately for each year. This window can extend into December.
+- **is_year_end_period:** 1 from December 20 through December 31, inclusive; 0 otherwise, covering Christmas and the lead-up to New Year's Day within the study period.
+
+Both indicators use the original flight date (FlightDate). These predefined travel windows are available before departure and serve as candidate predictors across the cancellation, delay, and taxi-time analyses. Their predictive value will be assessed during modeling.
