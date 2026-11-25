@@ -18,10 +18,18 @@ For a passenger flying with one of our selected airlines from a busy origin city
 We selected four airlines—**Frontier, American, Delta, and United（F9, AA, DL, and UA）**—and combined their data across all three years. We excluded rows where Diverted = 1, then selected the top 10 origin cities with the highest record counts in the remaining data for these four airlines.
 
 ## Our data plan is as follows:
-- Training set: Combine September–November data from 2023 and 2024 to train the baseline model.
-- Validation set: Use December data from 2023 and 2024 for model tuning and validation.
-- Test set: Use September–November 2025 data to evaluate model performance on unseen data.
-The final goal is to predict flight outcomes for December 2025.
+We use a chronological split shared across the cancellation, delay, and taxi-time analyses:
+
+- **Training set:** September–December 2023, September–December 2024, and September 2025.
+- **Validation set:** October 2025, used to select predictors, model specifications, and tuning parameters.
+- **Test set:** November 2025, held out from model fitting and selection for the final historical evaluation.
+
+This split includes both historical December periods in training and evaluates predictions on later months. In the current cleaned dataset, the training, validation, and test sets contain approximately 80.85%, 9.91%, and 9.24% of flight records, respectively. Each analysis applies its own outcome eligibility rules while retaining the same split
+assignment for each flight.
+
+The final prediction target is December 2025. 
+
+After model selection and historical test evaluation are complete, the selected model can be refitted using all eligible available records before generating predictions for December 2025.
 
 ## Data cleaning：
 Check for duplicate records and validate airport codes, airline codes, and scheduled dates and times. Add airport time zones and elevations, and standardize timestamps to account for UTC conversion, date rollovers, and daylight saving time.
