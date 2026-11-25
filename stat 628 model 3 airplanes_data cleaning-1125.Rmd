@@ -1,0 +1,572 @@
+---
+title: "stat 628 model 3 airplanes"
+output: pdf_document
+date: ""
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+count_fmt <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+```
+
+## Study scope
+
+The dataset covers September through December in 2023 and 2024 and September
+through November in 2025. We kept flights reported by F9, AA, DL, and UA,
+excluded flights marked as diverted, and ranked origin cities by the remaining
+record count across all four airlines and 11 months. We kept every destination
+served by flights departing from the ten highest-ranked cities. The filtered
+records and all original fields are saved in `flights_scoped.csv`.
+
+```{r scoping, echo=FALSE, message=FALSE}
+files <- c(
+  "airlines_2023_9.csv",  "airlines_2023_10.csv",
+  "airlines_2023_11.csv", "airlines_2023_12.csv",
+  "airlines_2024_9.csv",  "airlines_2024_10.csv",
+  "airlines_2024_11.csv", "airlines_2024_12.csv",
+  "airlines_2025_9.csv",  "airlines_2025_10.csv",
+  "airlines_2025_11.csv"
+)
+
+months <- sub("^airlines_(.*)\\.csv$", "\\1", files)
+
+files <- file.path("stat628_airplanes", files)
+
+missing_files <- files[!file.exists(files)]
+if (length(missing_files)) {
+  stop("Missing files: ", paste(missing_files, collapse = ", "))
+}
+
+airlines <- c("F9", "AA", "DL", "UA")
+in_scope <- function(x) {
+  x$Reporting_Airline %chin% airlines & (is.na(x$Diverted) | x$Diverted != 1L)
+}
+
+scope_cols <- c("Reporting_Airline", "Diverted", "OriginCityName")
+monthly_counts <- lapply(files, function(path) {
+  x <- fread(path, select = scope_cols)
+  x[in_scope(x) & !is.na(OriginCityName) & OriginCityName != "",
+    .(Records = .N), by = OriginCityName]
+})
+city_counts <- rbindlist(monthly_counts)[
+  , .(Records = sum(Records)), by = OriginCityName
+]
+setorder(city_counts, -Records, OriginCityName)
+stopifnot(nrow(city_counts) >= 10L)
+top_cities <- head(city_counts, 10)
+
+# Process one month at a time so only one full input file is held in memory.
+local_time_cols <- c("FlightDate", "CRSDepTime", "CRSArrTime",
+                     "DepTime", "ArrTime", "WheelsOff", "WheelsOn")
+char_cols <- c(local_time_cols, "CancellationCode")
+
+reference_header <- names(fread(files[1L], nrows = 0L))
+same_header <- vapply(files, function(path) {
+  identical(names(fread(path, nrows = 0L)), reference_header)
+}, logical(1))
+
+if (!all(same_header)) {
+  stop("Different column names or order: ",
+       paste(basename(files[!same_header]), collapse = ", "))
+}
+scoped_file <- "flights_scoped.csv"
+temp_file <- tempfile(pattern = "flights_scoped_", tmpdir = dirname(scoped_file))
+rows_written <- 0L
+
+for (i in seq_along(files)) {
+    x <- fread(files[i], colClasses = list(character = char_cols))
+  selected <- x[in_scope(x) & OriginCityName %chin% top_cities$OriginCityName]
+  rows_written <- rows_written + nrow(selected)
+  fwrite(selected, temp_file, append = i > 1L, col.names = i == 1L, na = "")
+}
+stopifnot(rows_written == sum(top_cities$Records), file.rename(temp_file, scoped_file))
+rm(x, selected)
+
+knitr::kable(top_cities[, .(`Origin city` = OriginCityName, Records = count_fmt(Records))],
+             align = "lr", caption = "Selected origin cities and flight record counts.")
+```
+
+## Cleaning and time conversion
+
+```{r validate-and-join, include=FALSE}
+flights <- fread(scoped_file, colClasses = list(character = char_cols))
+flights <- unique(flights)
+rows_after_dedup <- nrow(flights)
+flight_key <- c(
+  "FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline",
+  "OriginAirportID", "DestAirportID", "CRSDepTime"
+)
+repeated_keys <- flights[, .N, by = flight_key][N > 1L]
+
+valid_hhmm <- function(x) {
+  value <- suppressWarnings(as.integer(x))
+  !is.na(value) & grepl("^[0-9]{1,4}$", x) &
+    (value == 2400L | (value %/% 100L < 24L & value %% 100L < 60L))
+}
+
+expected_date <- with(flights, sprintf("%04d-%02d-%02d", Year, Month, DayofMonth))
+expected_month <- with(flights, sprintf("%04d_%d", Year, Month))
+valid_date <- !is.na(as.IDate(flights$FlightDate, format = "%Y-%m-%d")) &
+  flights$FlightDate == expected_date & expected_month %chin% months
+
+invalid_rows <- flights[
+  which(!(valid_date %in% TRUE) |
+          !(Reporting_Airline %chin% airlines) |
+          !grepl("^[A-Z0-9]{3}$", Origin) | !grepl("^[A-Z0-9]{3}$", Dest) |
+          !valid_hhmm(CRSDepTime) | !valid_hhmm(CRSArrTime)), .N
+]
+
+airport_codes <- unique(c(flights$Origin, flights$Dest))
+tz_lookup <- unique(fread("stat628_airplanes/airports_timezone.csv")[
+  iata_code %chin% airport_codes & iana_tz %chin% OlsonNames(), .(iata_code, iana_tz)
+])
+elev_lookup <- unique(fread("stat628_airplanes/airports_elevation.csv")[
+  iata_code %chin% airport_codes & !is.na(elevation_ft), .(iata_code, elevation_ft)
+])
+stopifnot(!anyDuplicated(tz_lookup$iata_code), !anyDuplicated(elev_lookup$iata_code))
+
+flights[, `:=`(
+  origin_tz = tz_lookup$iana_tz[match(Origin, tz_lookup$iata_code)],
+  dest_tz = tz_lookup$iana_tz[match(Dest, tz_lookup$iata_code)],
+  origin_elevation_ft = elev_lookup$elevation_ft[match(Origin, elev_lookup$iata_code)],
+  dest_elevation_ft = elev_lookup$elevation_ft[match(Dest, elev_lookup$iata_code)]
+)]
+missing_airports <- length(setdiff(airport_codes, intersect(
+  tz_lookup$iata_code, elev_lookup$iata_code
+)))
+
+carrier_lookup <- fread(
+  "carrier_codes.csv",
+  select = c("Code", "Description"),
+  colClasses = "character"
+)[Code %chin% airlines]
+
+stopifnot(
+  !anyDuplicated(carrier_lookup$Code),
+  setequal(carrier_lookup$Code, airlines)
+)
+
+flights[, carrier_name :=
+  carrier_lookup$Description[match(Reporting_Airline, carrier_lookup$Code)]]
+
+stopifnot(
+  invalid_rows == 0L,
+  !anyNA(flights$carrier_name),
+  !anyNA(flights$origin_tz),
+  !anyNA(flights$dest_tz)
+)
+```
+
+We dropped `r count_fmt(rows_written - rows_after_dedup)` exact duplicate rows.
+After that check, `r count_fmt(nrow(repeated_keys))` flight identifiers appeared
+more than once and `r count_fmt(invalid_rows)` records failed the airline,
+airport-code, date, or scheduled-time checks. We matched the origin and
+destination airports to their local time zones and elevations in feet.
+Of the `r count_fmt(length(airport_codes))` airports, `r count_fmt(missing_airports)`
+were missing a time zone or elevation.
+
+Departure and arrival times are reported in each airport's local time. We
+converted the four scheduled and actual times to UTC. We used the scheduled
+flight duration to identify the arrival date and to check which departure time
+fits when the same local hour occurs twice at the end of daylight saving time.
+We obtained actual times by adding the reported delay in minutes to the
+scheduled time and checked them against the recorded local times. A time
+reported as 2400 represents midnight at the end of the associated local day.
+
+```{r utc, include=FALSE}
+as_utc <- function(x) {
+  as.POSIXct(x, origin = "1970-01-01", tz = "UTC")
+}
+
+hhmm_normal <- function(x) {
+  out <- rep(NA_character_, length(x))
+  ok <- valid_hhmm(x)
+  out[ok] <- sprintf("%04d", as.integer(x[ok]) %% 2400L)
+  out
+}
+
+departure_candidates <- function(date, hhmm, zone, repeated) {
+  wall <- as_utc(as.numeric(date) * 86400)
+  value <- suppressWarnings(as.integer(hhmm))
+  value[!valid_hhmm(hhmm)] <- NA_integer_
+
+  # 2400 adds 24 hours and lands on midnight of the next local day.
+  wall <- wall + (value %/% 100L * 60L + value %% 100L) * 60
+
+  as_utc(as.numeric(lubridate::force_tz(
+    wall, tzone = zone, roll_dst = c("NA", repeated)
+  )))
+}
+
+flights[, c("sched_dep_utc", "sched_dep_late") := .(
+  departure_candidates(as.IDate(FlightDate), CRSDepTime, origin_tz[1L], "pre"),
+  departure_candidates(as.IDate(FlightDate), CRSDepTime, origin_tz[1L], "post")
+), by = origin_tz]
+
+flights[, c("early_ok", "late_ok") := {
+  arrival_clock <- hhmm_normal(CRSArrTime)
+  elapsed_seconds <- CRSElapsedTime * 60
+
+  .(
+    (format(sched_dep_utc + elapsed_seconds, "%H%M", tz = dest_tz[1L]) ==
+       arrival_clock) %in% TRUE,
+    (format(sched_dep_late + elapsed_seconds, "%H%M", tz = dest_tz[1L]) ==
+       arrival_clock) %in% TRUE
+  )
+}, by = dest_tz]
+
+# If a repeated local hour cannot be resolved, leave its UTC value missing.
+flights[
+  sched_dep_utc != sched_dep_late & early_ok == late_ok,
+  sched_dep_utc := as_utc(NA_real_)
+]
+flights[!early_ok & late_ok, sched_dep_utc := sched_dep_late]
+
+flights[, sched_arr_utc := sched_dep_utc + CRSElapsedTime * 60]
+flights[!early_ok & !late_ok, sched_arr_utc := as_utc(NA_real_)]
+flights[, sched_arr_verified := !is.na(sched_arr_utc)]
+flights[, c("sched_dep_late", "early_ok", "late_ok") := NULL]
+
+check_actual <- function(candidate, raw_clock, zone) {
+  fcase(
+    is.na(raw_clock) | raw_clock == "", "not_recorded",
+    is.na(candidate) | !valid_hhmm(raw_clock), "unverified",
+    format(candidate, "%H%M", tz = zone) == hhmm_normal(raw_clock), "verified",
+    default = "conflict"
+  )
+}
+
+flights[, `:=`(
+  actual_dep_utc = sched_dep_utc + DepDelay * 60,
+  actual_arr_utc = sched_arr_utc + ArrDelay * 60
+)]
+
+flights[, actual_dep_status := check_actual(
+  actual_dep_utc, DepTime, origin_tz[1L]
+), by = origin_tz]
+
+flights[, actual_arr_status := check_actual(
+  actual_arr_utc, ArrTime, dest_tz[1L]
+), by = dest_tz]
+
+# Signed UTC offset in minutes, e.g. -0700 becomes -420.
+offset_minutes <- function(t, zone) {
+  z <- format(t, "%z", tz = zone)
+  sign <- ifelse(substr(z, 1, 1) == "-", -1L, 1L)
+  sign * (60L * as.integer(substr(z, 2, 3)) +
+            as.integer(substr(z, 4, 5)))
+}
+
+# Try a one-hour adjustment only if the airport actually moved
+# its clock back and the adjusted instant matches the reported HHMM.
+fall_candidate <- function(scheduled, candidate, raw_clock, zone) {
+  shifted <- candidate + 3600
+  offset_change <- offset_minutes(scheduled, zone) -
+    offset_minutes(shifted, zone)
+
+  ok <- offset_change == 60L &
+    shifted >= scheduled &
+    format(shifted, "%H%M", tz = zone) == hhmm_normal(raw_clock)
+
+  shifted[!(ok %in% TRUE)] <- as_utc(NA_real_)
+  shifted
+}
+
+# Preserve the first-pass results for the final audit.
+flights[, `:=`(
+  dep_status_initial = actual_dep_status,
+  arr_status_initial = actual_arr_status
+)]
+
+flights[actual_dep_status == "conflict",
+  actual_dep_utc := fall_candidate(
+    sched_dep_utc, actual_dep_utc, DepTime, origin_tz[1L]
+  ), by = origin_tz]
+
+flights[actual_arr_status == "conflict",
+  actual_arr_utc := fall_candidate(
+    sched_arr_utc, actual_arr_utc, ArrTime, dest_tz[1L]
+  ), by = dest_tz]
+
+# Only clock-matched endpoints can support a duration comparison.
+flights[!(dep_status_initial %chin% c("verified", "conflict")),
+        actual_dep_utc := as_utc(NA_real_)]
+flights[!(arr_status_initial %chin% c("verified", "conflict")),
+        actual_arr_utc := as_utc(NA_real_)]
+
+# Keep this diagnostic even if a candidate is rejected below.
+flights[, elapsed_gap_min :=
+  as.numeric(difftime(actual_arr_utc, actual_dep_utc, units = "mins")) -
+    ActualElapsedTime]
+
+for (side in c("dep", "arr")) {
+  status <- paste0("actual_", side, "_status")
+  utc <- paste0("actual_", side, "_utc")
+  initial <- paste0(side, "_status_initial")
+
+  idx <- which(flights[[initial]] == "conflict" & !is.na(flights[[utc]]))
+
+  if (length(idx)) {
+    gap <- flights$elapsed_gap_min[idx]
+    set(flights, i = idx, j = status, value = fcase(
+      is.na(gap), "dst_clock_only",
+      gap == 0,   "verified_dst",
+      default =   "dst_elapsed_conflict"
+    ))
+  }
+
+  flights[!(get(status) %chin% c("verified", "verified_dst")),
+          (utc) := as_utc(NA_real_)]
+}
+```
+
+### How to read the time checks
+
+We checked the calculated UTC times against the local clock times in the
+original data. Each check uses the time zone of the airport where the event
+occurred.
+
+**Scheduled arrival.** We added the scheduled elapsed time (`CRSElapsedTime`)
+to `sched_dep_utc`, converted the result to the destination's local time, and
+compared the clock time with `CRSArrTime`. If they matched, we kept the result
+in `sched_arr_utc` and set `sched_arr_verified` to `TRUE`. For the
+`r count_fmt(sum(!flights$sched_arr_verified))` flights with `FALSE`, we left
+` sched_arr_utc` blank and kept the reported local time in `CRSArrTime`.
+
+**Actual departure and arrival.** We first added `DepDelay` or `ArrDelay` to
+the corresponding scheduled UTC time. Then we converted the result to local
+time and compared it with `DepTime` or `ArrTime`. The columns
+`dep_status_initial` and `arr_status_initial` record this first check.
+A value of `conflict` means the calculated and reported local clock times
+differed. This value can still appear in the initial columns after a successful
+correction.
+
+The final results are in `actual_dep_status` and `actual_arr_status`.
+
+- `verified` means the calculated time matched the reported local clock on
+  the first check.
+- `verified_dst` means a one-hour adjustment for the fall clock change matched
+  the reported local clock, and the resulting gate-to-gate duration agreed with
+  `ActualElapsedTime`.
+- `not_recorded` means the original local clock time was missing.
+- `unverified` means a local clock was recorded, but the information needed to
+  verify its UTC time was missing or invalid.
+- `dst_elapsed_conflict` means the adjustment matched the local clock, but the
+  resulting duration differed from `ActualElapsedTime`. If the duration check
+  cannot be completed, the status is `dst_clock_only`.
+
+The CSV keeps `actual_dep_utc` and `actual_arr_utc` when their final status is
+`verified` or `verified_dst`. The column `elapsed_gap_min` records the duration
+implied by the candidate UTC times minus the reported `ActualElapsedTime`.
+A value of zero means the durations agree. A positive value means the
+calculated duration is longer, and a blank means the comparison could not be
+made. The gap is kept even when a candidate UTC time is rejected.
+
+In this dataset, five actual timestamps across three flights failed the
+first check. We verified four after accounting for the fall clock change.
+For AA 1311, the candidate arrival time implied 258 minutes from departure
+to arrival, while the reported duration was 198 minutes. Its
+`elapsed_gap_min` is 60, and `actual_arr_utc` is blank.
+
+## Holiday travel-period indicators
+
+We added two binary indicators using the original flight date
+(`FlightDate`), based on the scheduled departure date at the origin.
+
+- `is_thanksgiving_period` equals 1 from three days before through
+  three days after Thanksgiving, inclusive. Thanksgiving is the fourth
+  Thursday of November, so this window runs from Monday through Sunday.
+- `is_year_end_period` equals 1 from December 20 through December 31,
+  inclusive, covering Christmas and the lead-up to New Year's Day
+  within the study period.
+
+Both indicators equal 0 outside their respective windows. The
+Thanksgiving window is calculated separately for each year and can
+extend into December. For example, the 2024 window includes December 1.
+
+These predefined windows represent potential travel-period effects,
+rather than official holiday durations. They use calendar information
+available before departure and are shared candidate predictors across
+the three modeling tasks. Their associations with flight outcomes
+and their predictive value will be assessed during modeling.
+
+```{r holiday-travel-periods, echo=FALSE}
+flights[, c("is_thanksgiving_period", "is_year_end_period") := {
+  flight_date <- as.IDate(FlightDate)
+  year_value <- .BY$Year
+
+  # Thanksgiving: the fourth Thursday of November.
+  # With %w, Sunday is 0 and Thursday is 4.
+  november_first <- as.IDate(sprintf("%04d-11-01", year_value))
+  thanksgiving <- november_first +
+    ((4L - as.integer(format(november_first, "%w")) + 7L) %% 7L) +
+    21L
+
+  year_end_start <- as.IDate(sprintf("%04d-12-20", year_value))
+  year_end_finish <- as.IDate(sprintf("%04d-12-31", year_value))
+
+  .(
+    as.integer(
+      flight_date >= thanksgiving - 3L &
+        flight_date <= thanksgiving + 3L
+    ),
+    as.integer(
+      flight_date >= year_end_start &
+        flight_date <= year_end_finish
+    )
+  )
+}, by = Year]
+
+stopifnot(
+  all(flights$is_thanksgiving_period %in% c(0L, 1L)),
+  all(flights$is_year_end_period %in% c(0L, 1L))
+)
+```
+
+
+## Analysis file
+
+We assigned data splits using the year and month of the original flight
+date. The training set contains September–December 2023,
+September–December 2024, and September 2025. October 2025 forms the
+validation set, and November 2025 forms the test set.
+
+This chronological split includes both historical December periods in
+training and assesses predictions on later months. The same assignments
+are used across the cancellation, delay, and taxi-time analyses.
+Task-specific eligibility rules are applied after the split is assigned.
+
+The final prediction target is December 2025. Since neither the
+validation nor the test set includes December, these evaluations assess
+performance on later autumn months rather than directly establishing
+accuracy during the Christmas and year-end travel period.
+
+```{r export, echo=FALSE}
+# Assign the same chronological split to all modeling tasks.
+flights[, split := fcase(
+  Year %in% c(2023L, 2024L) & Month %in% 9:12, "train",
+  Year == 2025L & Month == 9L, "train",
+  Year == 2025L & Month == 10L, "validation",
+  Year == 2025L & Month == 11L, "test",
+  default = NA_character_
+)]
+
+stopifnot(
+  nrow(flights) == rows_after_dedup,
+  !anyNA(flights$split),
+  setequal(flights$split, c("train", "validation", "test"))
+)
+flights[, `:=`(
+  use_cancel = Cancelled %in% c(0L, 1L),
+  use_dep_delay = Cancelled == 0L & !is.na(DepDelay),
+  use_arr_delay = Cancelled == 0L & !is.na(ArrDelay),
+  use_elapsed = Cancelled == 0L &
+    !is.na(actual_dep_utc) & !is.na(actual_arr_utc) &
+    !is.na(elapsed_gap_min) & elapsed_gap_min == 0
+)]
+fwrite(flights, "flights_cleaned.csv", na = "", dateTimeAs = "ISO")
+
+split_counts <- flights[, .(
+  records = .N,
+  cancelled = sum(Cancelled == 1L, na.rm = TRUE)
+), by = .(Split = split)]
+
+split_counts <- split_counts[
+  match(c("train", "validation", "test"), Split)
+]
+
+split_counts[, share := records / nrow(flights)]
+
+knitr::kable(
+  split_counts[, .(
+    Split,
+    `Flight records` = count_fmt(records),
+    `Share of records` = sprintf("%.2f%%", 100 * share),
+    `Cancelled flights` = count_fmt(cancelled)
+  )],
+  align = "lrrr",
+  caption = "Flight records and cancellations by chronological data split."
+)
+```
+
+### Using the analysis file
+
+Use `flights_cleaned.csv` for exploratory analysis and modeling. It contains
+`r count_fmt(nrow(flights))` flight records and `r ncol(flights)` columns.
+
+The `split` column identifies the training (`train`), validation
+(`validation`), and test (`test`) sets. Use the same split assignments
+for the cancellation, delay, and taxi-time analyses, and apply the
+outcome eligibility rules separately for each task. Consequently,
+the number of usable records may differ across analyses.
+
+Fit models and estimate preprocessing rules using training data.
+Use validation data to select predictors, model specifications, and
+tuning parameters. Apply the fitted preprocessing rules to validation
+and test data, and keep the test set out of model fitting and selection.
+
+After model selection and historical test evaluation are complete,
+refit the selected model using all eligible available records before
+predicting December 2025. The historical test results describe the
+model evaluated before this final refitting step.
+
+For each analysis, keep the rows where the corresponding flag is `TRUE`.
+
+- `use_cancel` includes flights with a recorded cancellation status of 0 or 1.
+  Both cancelled and non-cancelled flights are included.
+- `use_dep_delay` includes non-cancelled flights with a recorded `DepDelay`.
+- `use_arr_delay` includes non-cancelled flights with a recorded `ArrDelay`.
+  Both delay columns are in minutes. Negative values indicate early departure
+  or arrival.
+- `use_elapsed` includes non-cancelled flights with both actual UTC times
+  available and `elapsed_gap_min` equal to zero. Use these rows to analyze
+  verified gate-to-gate elapsed time.
+
+A flight can qualify for one analysis and be excluded from another. For example,
+AA 1311 has a reported arrival delay, so `use_arr_delay` is `TRUE`. Its actual
+arrival UTC could not be verified, so `use_elapsed` is `FALSE`.
+
+For predictions made before departure, use information available at prediction
+time, such as the airline, airports, flight date, and scheduled times. Use the
+`use_*` flags to select rows and `split` to assign data sets. Actual times,
+observed delays, and taxi times are available for defining outcomes and
+describing historical flights.
+
+
+```{r final-audit, echo=FALSE}
+# Coverage and analysis eligibility by year
+flights[, .(
+  records = .N,
+  cancelled = sum(Cancelled == 1L, na.rm = TRUE),
+  scheduled_arr_unverified = sum(!sched_arr_verified),
+  usable_dep_delay = sum(use_dep_delay),
+  usable_arr_delay = sum(use_arr_delay),
+  usable_elapsed = sum(use_elapsed)
+), by = .(Year, split)][order(Year, split)] |>
+  print()
+
+# Show all flights that had an actual-clock conflict on the first pass
+flights[
+  dep_status_initial == "conflict" | arr_status_initial == "conflict",
+  .(FlightDate, Reporting_Airline, Flight_Number_Reporting_Airline,
+    Origin, Dest, actual_dep_status, actual_arr_status, elapsed_gap_min)
+] |> print()
+
+# Final status and exported UTC availability must agree
+accepted <- c("verified", "verified_dst")
+stopifnot(
+  all(!is.na(flights$actual_dep_utc) ==
+        (flights$actual_dep_status %chin% accepted)),
+  all(!is.na(flights$actual_arr_utc) ==
+        (flights$actual_arr_status %chin% accepted)),
+  all(!is.na(flights$sched_arr_utc) == flights$sched_arr_verified)
+)
+```
+
+
+
+
+
+
+
+
